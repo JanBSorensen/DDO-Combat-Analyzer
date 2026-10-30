@@ -1,99 +1,181 @@
 # DDO Combat Analyzer
 
-DDO Combat Analyzer is a non-invasive combat analysis tool for **Dungeons & Dragons Online (DDO)**.
+DDO Combat Analyzer is a non-invasive combat analysis tool for **Dungeons & Dragons Online (DDO)**. It reads the visible Combat Log from screen capture and uses **Indra OCR** for live and post-combat analysis.
 
-The project captures the on-screen Combat Log, reconstructs scrolling combat text with OCR, and provides both:
+This repository contains the current source snapshot for both platforms:
 
-- **Live DPS estimates** during combat
-- **Post-combat analysis** based on reconstructed Combat Log data
+- **Windows:** DDO_Combat_Analyzer_Windows_LiveReplay_TEST
+- **Linux:** DDO_Combat_Analyzer_Linux_Mint_22_3_LiveReplay_TEST
 
-The Windows version is the primary development target. A Linux version is also maintained for users running DDO through Wine, Lutris, or Steam.
+The recorder identifies the current code line as **v5.3**.
 
-> **Status:** Active development. The post-analysis pipeline is currently more mature than the live-DPS pipeline.
+## Current features
 
-## Goals
+### Continuous live mode
 
-- No memory injection or game modification
-- Capture only the user-selected Combat Log area
-- Provide useful DPS feedback during combat
-- Reconstruct combat events after combat for more detailed analysis
-- Keep setup simple for non-technical users
-- Support both Windows and Linux
+Continuous live DPS is enabled by default.
 
-## Platforms
+- Rolling DPS/APM window: 5, 10, 15, 20, 30, or 60 seconds; 15 seconds is the default.
+- Default recording hotkey: Pause/Break.
+- Recording can also be started and stopped from the GUI.
+- Live DPS can continue while post-analysis runs.
+- Final post-analysis Session DPS is shown in the overlay for 10 seconds.
+- The overlay is shown only while DDO is the foreground window.
+- Live parsing pauses while DDO is not in the foreground.
+- Recording focus gaps are logged in **focus_interruptions.csv**.
 
-### Windows
+### Live reconstruction and OCR
 
-Primary platform. The application uses screen capture, OCR, and a desktop GUI.
+The current live pipeline uses:
 
-See [src/windows/README.md](src/windows/README.md).
+- 30 FPS visual tracking,
+- dynamic current-frame grid phase,
+- deferred handling of a partially visible newest bottom row,
+- full-height recovery after scrolling,
+- Stop/EOF fallback for a final pending row,
+- fast live scroll matching,
+- FastAlignment as a second opinion on frames classified as uncertain->zero,
+- Indra OCR,
+- DDO number-format validation and isolated OCR rechecks for suspicious values,
+- raw and corrected live damage values in **live_damage_events.csv**.
 
-### Linux
+OCR threads are selectable as Auto, 2, 4, 6, or 8. Auto uses 2 threads on systems with 1–2 physical CPU cores and 4 threads on systems with 3 or more physical cores.
 
-Linux support targets DDO running under Wine / Lutris / Steam.
-
-See [src/linux/README.md](src/linux/README.md).
-
-## Current analysis approach
+Line height can be Auto, 10, 12, 14, 16, 18, or 20 px.
 
 ### Post-analysis
 
-The recorder captures the selected Combat Log area at high frequency and stores changed frames losslessly. After combat, the analyzer:
+Post-analysis uses Indra OCR and saved lossless capture data to reconstruct the Combat Log and calculate combat statistics.
 
-1. aligns adjacent saved frames,
-2. detects Combat Log scrolling,
-3. extracts newly exposed text lines,
-4. OCRs those lines,
-5. parses damage and healing events,
-6. produces DPS and combat statistics.
+Current output includes:
 
-Post-analysis DPS is calculated from the reconstructed Combat Log and should generally be more accurate than the live estimate.
+- total and per-target damage,
+- damage by type,
+- sneak attack statistics,
+- blocked/resisted outgoing damage and observed DR/resistance types,
+- d20 attack-roll distribution,
+- critical-threat and confirmation information,
+- incoming damage and explicit defensive outcomes,
+- normalized chronological events,
+- Session DPS,
+- Recording DPS,
+- Active combat DPS,
+- rolling DPS/APM data,
+- data-quality diagnostics.
 
-### Live DPS
+### Session history and reanalysis
 
-The live system is being redesigned around:
+The GUI can:
 
-1. fast visual tracking of Combat Log scrolling,
-2. extraction of only newly exposed text lines,
-3. asynchronous OCR of those new lines,
-4. a tolerant live damage parser,
-5. rolling 15-second DPS.
+- browse saved sessions,
+- reopen already analyzed sessions without rerunning OCR,
+- reanalyze a selected session from its saved capture,
+- open the selected session folder,
+- run **Replay live test** on a saved capture.
 
-The goal is to avoid repeatedly OCRing the entire visible Combat Log.
+Replay live test runs the current live reconstruction/OCR/parser against an existing saved session and writes separate replay_live_* diagnostic files without overwriting the original live files.
 
-## Repository layout
+### Mob details
 
-```text
-DDO-Combat-Analyzer/
-├─ README.md
-├─ CHANGELOG.md
-├─ .gitignore
-├─ docs/
-│  ├─ ARCHITECTURE.md
-│  └─ TROUBLESHOOTING.md
-├─ src/
-│  ├─ common/
-│  ├─ windows/
-│  └─ linux/
-└─ tests/
-```
+Target rows can be opened in a detailed view containing:
 
-## Privacy and game integrity
+- overall damage/hit information,
+- natural d20 attack-roll table,
+- observed hit-threshold evidence,
+- critical confirmation details,
+- damage by type,
+- DR/resistance observations,
+- incoming damage and explicit defensive outcomes.
 
-DDO Combat Analyzer is designed to be non-invasive. It analyzes pixels from the user-selected Combat Log region and does not require modification of the DDO client.
+## Windows
 
-## Releases
+Source: [src/windows](src/windows)
 
-Finished end-user packages will be published through **GitHub Releases** rather than committed directly to the source tree.
+The Windows build uses a low-level keyboard hook for the recording hotkey and requests Administrator privileges at startup so the hook can work when an elevated DDO client has focus.
 
-Planned release assets:
+Dependencies in the current package:
 
-- `DDO_Combat_Analyzer_Windows_<version>.zip`
-- `DDO_Combat_Analyzer_Linux_<version>.zip`
+- MSS
+- OpenCV
+- NumPy
+- Indra OCR
+- FFmpeg
 
-## License
+Detailed package instructions are in [src/windows/README.txt](src/windows/README.txt).
 
-A project license has not yet been selected. Dependency and OCR-engine license compatibility will be reviewed before the repository is made public.
+## Linux
+
+Source: [src/linux](src/linux)
+
+The current Linux build targets:
+
+- Linux Mint 22.3 Cinnamon, 64-bit
+- **X11**
+- DDO through Wine/Lutris or Steam/Proton
+- the analyzer running natively on Linux
+
+Linux adds X11-specific window detection, focus handling, global hotkeys and overlay handling in **linux_x11.py**.
+
+Dependencies in the current package include the Windows Python dependencies plus **python-xlib**; setup also uses FFmpeg, **xdotool** and **wmctrl**.
+
+Detailed package instructions are in [src/linux/README.txt](src/linux/README.txt).
+
+## Source layout
+
+~~~text
+src/
+├─ windows/
+│  ├─ README.txt
+│  ├─ SETUP DDO Combat Analyzer.cmd
+│  ├─ START DDO Combat Analyzer.cmd
+│  └─ _internal/
+│     ├─ DDO Combat Analyzer.pyw
+│     ├─ continuous_live.py
+│     ├─ cpu_utils.py
+│     ├─ launch_gui.py
+│     ├─ live_overlay.py
+│     ├─ overlay_positioner.py
+│     ├─ process_latest.py
+│     ├─ record_optimized.py
+│     ├─ replay_live_test.py
+│     ├─ select_log_area_gui.py
+│     ├─ config.json
+│     └─ requirements.txt
+└─ linux/
+   ├─ README.txt
+   ├─ SETUP DDO Combat Analyzer.sh
+   ├─ START_DDO_COMBAT_ANALYZER.sh
+   └─ _internal/
+      ├─ DDO Combat Analyzer.pyw
+      ├─ continuous_live.py
+      ├─ cpu_utils.py
+      ├─ launch_gui.py
+      ├─ linux_x11.py
+      ├─ live_overlay.py
+      ├─ overlay_positioner.py
+      ├─ process_latest.py
+      ├─ record_optimized.py
+      ├─ replay_live_test.py
+      ├─ select_log_area_gui.py
+      ├─ config.json
+      └─ requirements.txt
+~~~
+
+## Capture area
+
+The packages contain no preconfigured Combat Log area.
+
+The validated reference area is approximately **885 × 522 px**. If the selected area is less than 70% of that width or height, the GUI warns the user but still allows the selection.
+
+A dark, opaque Combat Log background gives the most reliable tracking and OCR.
+
+## Current platform limitation
+
+The Linux package is specifically an **X11** build. Wayland is not supported by the current Linux window/focus/hotkey implementation.
+
+## Game integrity
+
+The analyzer works from screen capture of the user-selected Combat Log region. It does not modify or inject into the DDO client.
 
 ## Disclaimer
 
