@@ -1,92 +1,161 @@
 # Architecture
 
-## Design principles
+This document describes the code currently present in the Windows and Linux LiveReplay test builds.
 
-DDO Combat Analyzer is intentionally non-invasive. Its primary input is the visible DDO Combat Log.
+## Main components
 
-The application is split conceptually into four pipelines:
+Both platform trees contain the same main application modules.
 
-1. capture,
-2. visual reconstruction,
-3. OCR,
-4. parsing and reporting.
+### DDO Combat Analyzer.pyw
 
-## Post-analysis pipeline
+Tkinter GUI and results interface. It controls recording, analysis, session history, configuration, detailed result views and Replay live test.
 
-The post-analysis path prioritizes reconstruction quality over immediate latency.
+### continuous_live.py
 
-### Capture
+Runs continuous live mode, including live screen tracking, OCR coordination, hotkey/session control and the transition between recording and post-analysis.
 
-- User selects the Combat Log region.
-- The region is captured at approximately 30 FPS.
-- Frames are converted to grayscale.
-- A lightweight change detector decides which frames need to be stored.
-- Forced anchor frames are periodically retained.
-- Changed frames are stored losslessly.
+### live_overlay.py
 
-### Reconstruction
+Live DPS/APM overlay and live Combat Log processing. The current live path uses Indra OCR and visual line/scroll tracking.
 
-Adjacent stored frames are visually aligned.
+### record_optimized.py
 
-The analyzer estimates vertical Combat Log movement, normally in multiples of the configured line height. Newly exposed line cells are extracted rather than OCRing every full frame.
+Records the selected Combat Log region at a 30 FPS target rate. Changed frames and forced anchors are stored losslessly for post-analysis.
 
-### OCR
+The recorder identifies the current code line as v5.3.
 
-Newly exposed line images are OCRed.
+### process_latest.py
 
-Numeric corrections are applied conservatively inside numeric fields, for example likely OCR confusions such as:
+Post-analysis reconstruction, OCR, parsing, statistics and report generation.
 
-- S -> 5
-- O -> 0
-- I / l / | -> 1
+The post-analysis path includes Fast Grid/line-height handling, FastAlignment fallback, OCR batching, numeric correction, combat-event normalization, damage/DR/attack/crit statistics and DPS/APM calculations.
 
-### Parsing
+### replay_live_test.py
 
-Recognized events include outgoing damage, sneak-attack damage, healing, and selected incoming-damage forms.
+Runs the current live reconstruction/OCR/parser against a saved recording. Replay output uses separate replay_live_* files and does not overwrite the original live data.
 
-Generated outputs include damage totals, target/type breakdowns, event CSVs, reconstruction diagnostics, and rolling DPS data.
+### select_log_area_gui.py
+
+Frozen-screen Combat Log area selection.
+
+### overlay_positioner.py
+
+Standard and custom overlay positioning relative to the DDO client window.
+
+### cpu_utils.py
+
+Physical CPU-core detection and OCR-thread selection helpers.
+
+### launch_gui.py
+
+Platform launcher and startup error handling.
+
+### config.json
+
+Default capture, tracking, analysis, live-DPS, OCR-thread, line-height, overlay and UI settings.
 
 ## Live pipeline
 
-The first live implementation repeatedly OCRed a large visible Combat Log block and attempted to infer new lines from OCR text overlap.
+The current live processing path is:
 
-Testing showed this was too fragile:
-
-- OCRing the whole region was slow.
-- repeated combat text made text-overlap alignment ambiguous,
-- OCR artifacts could become false anchors,
-- many real damage lines were visible in OCR output but were rejected as not-new.
-
-The replacement design is:
-
-```text
-high-frequency screen capture
+~~~text
+DDO Combat Log pixels
         |
         v
-visual scroll detection
+30 FPS visual tracking
         |
         v
-new line extraction + timestamp
+grid phase + scroll detection
         |
         v
-asynchronous OCR queue
+newly exposed line handling
         |
         v
-tolerant live damage parser
+Indra OCR
         |
         v
-rolling 15-second DPS
-```
+live parser + numeric validation/correction
+        |
+        v
+rolling DPS/APM + live event files
+~~~
 
-This lets image tracking run much faster than OCR and preserves event timing even when OCR finishes slightly later.
+The current implementation includes:
 
-## Platform separation
+- dynamic current-frame grid phase,
+- deferred partially visible bottom row,
+- full-height recovery after scrolling,
+- Stop/EOF fallback for a final pending row,
+- fast scroll matching,
+- FastAlignment second opinion for uncertain->zero cases,
+- DDO comma-thousands validation,
+- isolated OCR rechecks for suspicious numeric values,
+- duplicated-one protection,
+- raw and corrected live damage values.
 
-Shared analysis logic should gradually move into `src/common/`.
+## Post-analysis pipeline
 
-Platform-specific concerns remain under:
+The post-analysis path is:
 
-- `src/windows/`
-- `src/linux/`
+~~~text
+saved lossless changed frames
+        |
+        v
+frame alignment / scroll reconstruction
+        |
+        v
+visual line extraction
+        |
+        v
+Indra OCR
+        |
+        v
+combat-event parsing and normalization
+        |
+        v
+reports, CSVs and GUI statistics
+~~~
 
-Examples include process launching, window focus, global hotkeys, overlay behavior, and installer scripts.
+Post-analysis produces damage/healing events, target/type summaries, normalized events, DR/resistance observations, attack and crit data, incoming-defense data, rolling DPS/APM data, session summaries and timing/data-quality diagnostics.
+
+## Focus handling
+
+Live parsing is active only while DDO is the foreground window.
+
+During a recording, focus interruptions are stored in **focus_interruptions.csv**. Post-analysis starts a new reconstruction segment after a focus gap instead of assuming that hidden Combat Log text was captured.
+
+## Windows-specific code
+
+The Windows build uses native Windows APIs for:
+
+- DDO foreground-window detection,
+- low-level recording hotkey handling,
+- overlay behavior,
+- process launching and focus handling.
+
+The hotkey is consumed only while DDO is the foreground window.
+
+## Linux-specific code
+
+The Linux build adds **linux_x11.py**.
+
+It handles:
+
+- X11/EWMH DDO-window detection,
+- foreground/focus checks,
+- global Pause/Break/F-key hotkeys,
+- X11 window positioning,
+- Wine/Lutris/Steam/Proton window matching.
+
+The Linux implementation targets Cinnamon/X11 and does not target Wayland.
+
+## OCR
+
+Both builds use Indra OCR.
+
+Selectable OCR thread counts are Auto, 2, 4, 6 and 8. Auto resolves to:
+
+- 2 threads on 1–2 physical CPU cores,
+- 4 threads on 3 or more physical CPU cores.
+
+The same thread setting is used by live and post-analysis OCR.
