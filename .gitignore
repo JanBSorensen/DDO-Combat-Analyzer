@@ -1,0 +1,93 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.python-version
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Runtime logs
+*.log
+startup_error.log
+live_overlay_stderr.log
+live_overlay_error.txt
+
+# Combat session output
+combat_*/
+sessions/
+session_*/
+LATEST_SESSION.txt
+recording_clock.json
+live_status.json
+live_stop.flag
+
+# Generated combat data
+capture_index.csv
+alignment.csv
+ocr_lines.csv
+ocr_numeric_corrections.csv
+damage_events.csv
+damage_by_target.csv
+damage_by_target_and_type.csv
+outgoing_damage_by_type.csv
+unparsed_damage_like_lines.csv
+dps_15s.csv
+live_dps.csv
+live_ocr_scans.csv
+post_analysis_timings.csv
+COMBAT_REPORT.txt
+combat_log.txt
+recording_summary.txt
+config_used.json
+
+# Generated images / video
+*.mkv
+*.avi
+*.mp4
+line_*.png
+ocr_*.png
+frames/
+ocr_lines/
+debug_frames/
+last_selector_screenshot.png
+
+# Build / package output
+build/
+dist/
+release/
+releases/
+*.exe
+*.msi
+*.AppImage
+*.deb
+*.rpm
+
+# Downloaded / bundled dependencies
+_internal/bin/
+vendor/
+third_party/bin/
+
+# Local configuration
+config.json
+config.local.json
+python_path.txt
+pythonw_path.txt
+
+# Archives and local test packages
+*.zip
+*.7z
+*.tar
+*.tar.gz
