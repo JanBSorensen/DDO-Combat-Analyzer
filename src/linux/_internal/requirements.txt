@@ -1,0 +1,5 @@
+mss
+opencv-python
+numpy
+indra-ocr
+python-xlib
