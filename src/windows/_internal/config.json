@@ -1,0 +1,66 @@
+{
+  "capture": {
+    "left": 0,
+    "top": 0,
+    "width": 0,
+    "height": 0
+  },
+  "capture_fps": 30,
+  "start_delay_seconds": 0,
+  "ffmpeg_path": "",
+  "text_change": {
+    "feature_threshold": 18,
+    "pixel_difference_threshold": 0.12,
+    "changed_pixel_ratio_to_save": 0.0015,
+    "force_anchor_every_seconds": 0.5,
+    "ignore_border_pixels": 5
+  },
+  "analysis": {
+    "line_height": 14,
+    "max_scroll_pixels": 384,
+    "min_alignment_score": 0.8,
+    "min_improvement_over_zero": 0.035,
+    "close_score_tolerance": 0.008,
+    "auto_line_height": true,
+    "line_height_min": 10,
+    "line_height_max": 22,
+    "line_height_mode": "auto",
+    "last_detected_line_height": 14,
+    "adaptive_linewise": true,
+    "whole_frame_confident_score": 0.97,
+    "whole_frame_confident_margin": 0.04,
+    "whole_frame_confident_positive_improvement": 0.08,
+    "zero_first_enabled": true,
+    "zero_first_threshold": 0.995,
+    "combat_inactivity_timeout_seconds": 5.0
+  },
+  "status_every_seconds": 5,
+  "capture_configured": false,
+  "live_dps": {
+    "enabled": true,
+    "overlay": true,
+    "tracking_fps": 30,
+    "max_live_scroll_pixels": 384,
+    "min_alignment_score": 0.8,
+    "min_improvement_over_zero": 0.02,
+    "close_score_tolerance": 0.008,
+    "ocr_queue_max_lines": 512,
+    "overlay_width": 560,
+    "overlay_height": 190,
+    "overlay_margin": 20,
+    "overlay_position": "top_center",
+    "ocr_engine": "indra",
+    "ocr_batch_max_lines": 12,
+    "indra_threads": "auto",
+    "continuous_mode": true,
+    "recording_hotkey": "Pause/Break",
+    "result_display_seconds": 10.0,
+    "overlay_x_ratio": 0.5,
+    "overlay_y_ratio": 0.12,
+    "font_size": 24,
+    "rolling_window_seconds": 15.0
+  },
+  "ui": {
+    "first_run_guide_shown": false
+  }
+}
