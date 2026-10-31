@@ -1393,12 +1393,11 @@ class App(tk.Tk):
         d20_tree = self._detail_tree(
             attacks_tab,
             ("roll", "attacks", "miss", "graze", "hit", "threat", "other", "confirmed", "failed_confirm"),
-            ("d20", "Attacks", "Miss", "Graze", "Normal hit", "Crit threat", "Other", "Confirmed crits", "Failed confirms"),
-            (60, 85, 75, 75, 90, 95, 70, 115, 110),
-            numeric_columns=("roll", "attacks", "miss", "graze", "hit", "threat", "other", "confirmed", "failed_confirm"),
+            ("d20", "Attacks", "Miss", "Graze", "Normal hit", "Crit threat", "Other", "Confirmed (2-19)", "Failed (2-19)"),
+            (60, 85, 75, 75, 90, 95, 70, 125, 115),
+            numeric_columns=("roll", "attacks", "miss", "graze", "hit", "threat", "other"),
         )
-        by_roll = {n: {"attacks": 0, "miss": 0, "graze": 0, "hit": 0, "threat": 0, "other": 0, "confirmed": 0, "failed_confirm": 0} for n in range(1, 21)}
-        attack_line_to_roll = {}
+        by_roll = {n: {"attacks": 0, "miss": 0, "graze": 0, "hit": 0, "threat": 0, "other": 0, "confirmed": 0, "failed_confirm": 0, "confirm_attempts": 0} for n in range(1, 21)}
         for r in mob_attacks:
             roll = self._as_int(r.get("roll"), -1)
             if roll not in by_roll:
@@ -1416,33 +1415,54 @@ class App(tk.Tk):
                 d["hit"] += 1
             else:
                 d["other"] += 1
-            line = str(r.get("line", "")).strip()
-            if line:
-                attack_line_to_roll[line] = roll
         for r in mob_confirms:
-            linked = str(r.get("linked_attack_line", "")).strip()
-            roll = attack_line_to_roll.get(linked)
+            # Confirmation statistics are grouped by the confirmation d20 itself,
+            # not by the linked attack roll that produced the critical threat.
+            roll = self._as_int(r.get("roll"), -1)
             if roll not in by_roll:
+                continue
+            by_roll[roll]["confirm_attempts"] += 1
+            if roll in (1, 20):
                 continue
             confirmed_value = str(r.get("confirmed", "")).strip().lower() in ("1", "true", "yes")
             by_roll[roll]["confirmed" if confirmed_value else "failed_confirm"] += 1
         for roll in range(1, 21):
             d = by_roll[roll]
-            d20_tree.insert("", "end", values=(roll, d["attacks"], d["miss"], d["graze"], d["hit"], d["threat"], d["other"], d["confirmed"], d["failed_confirm"]))
+            if roll == 1:
+                confirmed_cell = "—"
+                failed_cell = "Auto fail" if not d["confirm_attempts"] else f"Auto fail ({d['confirm_attempts']})"
+            elif roll == 20:
+                confirmed_cell = "Auto confirm" if not d["confirm_attempts"] else f"Auto confirm ({d['confirm_attempts']})"
+                failed_cell = "—"
+            else:
+                confirmed_cell = d["confirmed"]
+                failed_cell = d["failed_confirm"]
+            d20_tree.insert("", "end", values=(roll, d["attacks"], d["miss"], d["graze"], d["hit"], d["threat"], d["other"], confirmed_cell, failed_cell))
 
         # Crits: target-level summary plus every confirmation roll.
         crit_summary = ttk.LabelFrame(crits_tab, text="Critical summary", padding=10)
         crit_summary.pack(fill="x", pady=(0, 10))
-        confirm_attempts = self._as_int(crit_row.get("confirm_attempts"), len(mob_confirms))
-        confirm_rate = self._as_float(crit_row.get("confirm_rate_percent"))
+        mob_confirms_2_19 = []
+        for r in mob_confirms:
+            roll = self._as_int(r.get("roll"), -1)
+            if 2 <= roll <= 19:
+                mob_confirms_2_19.append(r)
+        confirm_attempts = len(mob_confirms_2_19)
+        confirmed_2_19 = sum(
+            1 for r in mob_confirms_2_19
+            if str(r.get("confirmed", "")).strip().lower() in ("1", "true", "yes")
+        )
+        failed_confirms_2_19 = confirm_attempts - confirmed_2_19
+        confirm_rate = (100.0 * confirmed_2_19 / confirm_attempts) if confirm_attempts else 0.0
         crit_rate = self._as_float(crit_row.get("crit_rate_percent"))
         observed = crit_row.get("observed_confirm", "") or "—"
         high_fail = crit_row.get("highest_failed_confirm_total", "") or "—"
         low_success = crit_row.get("lowest_successful_confirm_total", "") or "—"
         ttk.Label(
             crit_summary,
-            text=(f"Threats: {threats:,}    Confirm attempts: {confirm_attempts:,}    Confirmed: {confirmed:,}    "
-                  f"Failed: {failed_confirms:,}    Crit rate: {crit_rate:.1f}%    Confirm rate: {confirm_rate:.1f}%"),
+            text=(f"Threats: {threats:,}    Crits: {confirmed:,}    Crit rate: {crit_rate:.1f}%    "
+                  f"Confirm rolls 2-19: {confirm_attempts:,}    Confirmed: {confirmed_2_19:,}    "
+                  f"Failed: {failed_confirms_2_19:,}    Confirm rate: {confirm_rate:.1f}%"),
             style="Section.TLabel",
         ).pack(anchor="w")
         ttk.Label(
@@ -1453,7 +1473,7 @@ class App(tk.Tk):
         ).pack(anchor="w", pady=(4, 0))
         ttk.Label(
             crit_summary,
-            text="Natural 1/20 confirmation rolls are excluded from threshold bounds.",
+            text="Natural 1 = auto fail and natural 20 = auto confirm; both are excluded from Confirm % and threshold bounds.",
             style="Small.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
@@ -1471,7 +1491,13 @@ class App(tk.Tk):
                 display_time = self._format_graph_time(float(raw_time))
             except Exception:
                 display_time = ""
-            result = "CRIT" if str(r.get("confirmed", "")).strip().lower() in ("1", "true", "yes") else "FAILED"
+            roll = self._as_int(r.get("roll"), -1)
+            if roll == 1:
+                result = "AUTO FAIL"
+            elif roll == 20:
+                result = "AUTO CONFIRM"
+            else:
+                result = "CRIT" if str(r.get("confirmed", "")).strip().lower() in ("1", "true", "yes") else "FAILED"
             confirm_tree.insert("", "end", values=(display_time, r.get("roll", ""), r.get("bonus", ""), r.get("total", ""), result, r.get("text", "")))
 
         # Damage by type.
@@ -1694,8 +1720,8 @@ class App(tk.Tk):
         frame.rowconfigure(0, weight=1); frame.columnconfigure(0, weight=1)
         headings = {
             "target": "Target", "attacks": "Attacks", "hits": "Hits", "grazes": "Grazes", "misses": "Misses",
-            "threats": "Threats", "crits": "Crits", "failed": "Failed",
-            "grazepct": "Graze %", "critpct": "Crit %", "confpct": "Conf. %",
+            "threats": "Threats", "crits": "Crits", "failed": "Fail 2-19",
+            "grazepct": "Graze %", "critpct": "Crit %", "confpct": "Conf. % 2-19",
             "highfail": "High fail", "lowsuccess": "Low success", "observed": "Observed confirm",
         }
         widths = {
@@ -3659,6 +3685,20 @@ class App(tk.Tk):
             f"Peak {window_short} APM: —" if peak_apm is None else f"Peak {window_short} APM: {int(round(peak_apm))}"
         )
 
+        confirm_stats_2_19 = defaultdict(lambda: {"attempts": 0, "confirmed": 0, "failed": 0})
+        for event in attack_rows:
+            if event.get("event") != "confirm":
+                continue
+            roll = self._as_int(event.get("roll"), -1)
+            if not 2 <= roll <= 19:
+                continue
+            d = confirm_stats_2_19[event.get("target", "")]
+            d["attempts"] += 1
+            if str(event.get("confirmed", "")).strip().lower() in ("1", "true", "yes"):
+                d["confirmed"] += 1
+            else:
+                d["failed"] += 1
+
         self.clear_tree(self.attack_summary_tree)
         for r in crit_rows:
             def pct(name):
@@ -3666,10 +3706,16 @@ class App(tk.Tk):
                     return f"{float(r.get(name, '0') or 0):.1f}%"
                 except Exception:
                     return "—"
+            target = r.get("target", "")
+            cstat = confirm_stats_2_19[target]
+            confirm_pct_2_19 = (
+                f"{(100.0 * cstat['confirmed'] / cstat['attempts']):.1f}%"
+                if cstat["attempts"] else "0.0%"
+            )
             self.attack_summary_tree.insert("", "end", values=(
-                r.get("target", ""), r.get("attacks", ""), r.get("hits", ""), r.get("grazing_hits", ""), r.get("misses", ""),
-                r.get("critical_threats", ""), r.get("confirmed_crits", ""), r.get("failed_confirms", ""),
-                pct("grazing_rate_percent"), pct("crit_rate_percent"), pct("confirm_rate_percent"),
+                target, r.get("attacks", ""), r.get("hits", ""), r.get("grazing_hits", ""), r.get("misses", ""),
+                r.get("critical_threats", ""), r.get("confirmed_crits", ""), cstat["failed"],
+                pct("grazing_rate_percent"), pct("crit_rate_percent"), confirm_pct_2_19,
                 r.get("highest_failed_confirm_total", "") or "—",
                 r.get("lowest_successful_confirm_total", "") or "—",
                 r.get("observed_confirm", "") or "—",
@@ -3684,7 +3730,13 @@ class App(tk.Tk):
                 display_time = self._format_graph_time(float(raw_time))
             except Exception:
                 display_time = ""
-            result = "CRIT" if str(r.get("confirmed", "")).strip() in ("1", "true", "True") else "FAILED"
+            roll = self._as_int(r.get("roll"), -1)
+            if roll == 1:
+                result = "AUTO FAIL"
+            elif roll == 20:
+                result = "AUTO CONFIRM"
+            else:
+                result = "CRIT" if str(r.get("confirmed", "")).strip().lower() in ("1", "true", "yes") else "FAILED"
             self.confirm_tree.insert("", "end", values=(
                 display_time, r.get("target", ""), r.get("roll", ""), r.get("bonus", ""),
                 r.get("total", ""), result, r.get("text", "")
