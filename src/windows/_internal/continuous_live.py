@@ -82,6 +82,8 @@ def overlay_xy(cfg, width, height, fallback_mon):
     return x, y
 
 
+from live_ocr_log import new_row, write_log, filter_session_to_stop
+
 class ContinuousLiveEstimator(LiveEstimator):
     """Persistent live OCR/DPS monitor.
 
@@ -115,6 +117,10 @@ class ContinuousLiveEstimator(LiveEstimator):
         self.session_collecting = False
         self.session_live_event_rows = []
         self.session_live_samples = []
+        self.session_ocr_rows = []
+        # A short pre-session ring prevents lost OCR lines around START_SESSION.
+        self.ocr_recent_rows = deque(maxlen=20000)
+        self.session_ocr_dropped_at_start = 0
         self.session_events = deque()  # (relative elapsed, amount)
         self.session_raw_total = 0
         self.session_final_total = 0
@@ -149,7 +155,10 @@ class ContinuousLiveEstimator(LiveEstimator):
         if rel is None or rel < -0.05:
             return False, rel
         stop = self.session_stop_elapsed
-        if stop is not None and float(event_elapsed) > float(stop) + 0.05:
+        # A crop detected after STOP is not part of the recorded fight.  The old
+        # 50-ms grace period let post-Stop hits enter live while they were absent
+        # from FFV1 (seen at 26.403s vs recording end 26.386s).
+        if stop is not None and float(event_elapsed) > float(stop) + 1e-6:
             return False, rel
         return self.session_path is not None, rel
 
@@ -177,6 +186,28 @@ class ContinuousLiveEstimator(LiveEstimator):
                 batch_ocr_text or '', verification_ocr_text or '',
             ))
             self.session_events.append((max(0.0, float(rel)), final_amount))
+
+    def record_live_ocr_line(self, elapsed, raw, effective, amount,
+                             numeric_recheck, numeric_recheck_amount, event_elapsed):
+        # The persistent helper must not accumulate unbounded OCR history.
+        # Only rows inside the exact recording clock bounds enter a session.
+        row = new_row(elapsed, self.start_epoch, raw, effective, amount,
+                      numeric_recheck, numeric_recheck_amount, event_elapsed)
+        with self.session_lock:
+            self.ocr_recent_rows.append(row)
+            if self.session_path is not None and self.session_start_elapsed is not None:
+                ok, rel = self._event_in_session(elapsed)
+                if ok:
+                    record = dict(row)
+                    record['capture_elapsed_seconds'] = max(0.0, rel)
+                    if record.get('event_capture_elapsed_seconds') != '':
+                        record['event_capture_elapsed_seconds'] = max(
+                            0.0, float(record['event_capture_elapsed_seconds']) - self.session_start_elapsed)
+                    self.session_ocr_rows.append(record)
+
+    def write_live_ocr_log(self):
+        # Continuous sessions are flushed on FLUSH_SESSION, never at worker exit.
+        return
 
     def write_live_damage_events(self):
         # Base ocr_worker calls this only at process shutdown. Session flushing
@@ -242,6 +273,19 @@ class ContinuousLiveEstimator(LiveEstimator):
             self.session_collecting = True
             self.session_live_event_rows = []
             self.session_live_samples = []
+            self.session_ocr_rows = []
+            self.session_ocr_dropped_at_start = self.dropped_lines_total
+            # OCR from the capture may have completed before START_SESSION was
+            # delivered by the GUI. Recover these already-recognized rows.
+            for old_row in self.ocr_recent_rows:
+                offset = float(old_row['capture_wall_epoch']) - start_epoch
+                if offset >= -0.02:
+                    recovered = dict(old_row)
+                    recovered['capture_elapsed_seconds'] = max(0.0, offset)
+                    if recovered.get('event_capture_elapsed_seconds') != '':
+                        recovered['event_capture_elapsed_seconds'] = max(
+                            0.0, float(recovered['event_capture_elapsed_seconds']) - self.session_start_elapsed)
+                    self.session_ocr_rows.append(recovered)
             self.session_events = deque()
             self.session_raw_total = 0
             self.session_final_total = 0
@@ -251,6 +295,11 @@ class ContinuousLiveEstimator(LiveEstimator):
                 'ocr': self.ocr_lines_total,
                 'dropped': self.dropped_lines_total,
                 'attacks': self.parsed_attacks_total,
+                'tracking_frames': self.tracking_frames,
+                'phase_corrected_scrolls': self.phase_corrected_scrolls,
+                'anchor_phase_timeout_rebases': self.anchor_phase_timeout_rebases,
+                'robust_fallback_overrides': self.robust_fallback_overrides,
+                'anchor_linewise_overrides': self.anchor_linewise_overrides,
             }
 
     def _stop_session(self, stop_epoch_text=''):
@@ -289,21 +338,67 @@ class ContinuousLiveEstimator(LiveEstimator):
         # Give asynchronous OCR a chance to consume all line crops captured at
         # or before the recording stop boundary. New post-stop lines do not
         # enter the session buffer because _event_in_session checks the boundary.
-        deadline = time.time() + 3.0
+        deadline = time.time() + 5.0
+        session_ocr_drained = False
         while time.time() < deadline:
             with self.session_lock:
                 boundary = self.session_stop_elapsed
-            if boundary is None or self.last_ocr_elapsed_processed >= boundary or self.ocr_queue.qsize() == 0:
+            # The last OCR row is not necessarily near Stop. Instead inspect
+            # pending/in-flight capture timestamps and wait only for pre-stop
+            # work, never for the continuous after-Stop DDO activity.
+            with self.ocr_queue.mutex:
+                waiting_pre_stop = any(float(item[0]) <= boundary + 1e-6
+                                       for item in self.ocr_queue.queue) if boundary is not None else False
+            inflight_pre_stop = any(float(x) <= boundary + 1e-6
+                                    for x in self.ocr_batch_inflight) if boundary is not None else False
+            if not waiting_pre_stop and not inflight_pre_stop:
+                session_ocr_drained = True
                 break
-            time.sleep(0.03)
+            time.sleep(0.04)
         with self.session_lock:
             path = self.session_path or self.last_session_path
             if path is None:
                 return
             event_rows = list(self.session_live_event_rows)
             live_rows = list(self.session_live_samples)
+            ocr_rows = list(self.session_ocr_rows)
+            # STOP_SESSION can arrive a little later than the GUI's STOP
+            # button. Apply its authoritative, transmitted timestamp again
+            # here before writing, removing any already-buffered late rows.
+            stop_rel = (self.session_stop_elapsed - self.session_start_elapsed
+                        if self.session_stop_elapsed is not None
+                        and self.session_start_elapsed is not None else None)
+            event_rows, ocr_rows, live_rows, stop_filter_stats = filter_session_to_stop(
+                event_rows, ocr_rows, live_rows, stop_rel)
+            dropped_during = max(0, self.dropped_lines_total - self.session_ocr_dropped_at_start)
+            started_epoch = self.session_start_epoch
+            stopped_epoch = self.start_epoch + self.session_stop_elapsed if self.session_stop_elapsed is not None else None
+            start_tracking = dict(self.session_snapshot)
+            tracker_counts = {
+                key: max(0, int(getattr(self, key, 0)) - int(start_tracking.get(key, 0)))
+                for key in ('tracking_frames', 'phase_corrected_scrolls',
+                            'anchor_phase_timeout_rebases', 'robust_fallback_overrides',
+                            'anchor_linewise_overrides')
+            }
+            recording_length = max(0.0, (stopped_epoch or 0.0) - (started_epoch or 0.0))
+            last_ocr = max((float(r.get('capture_elapsed_seconds', 0.0)) for r in ocr_rows),
+                           default=None)
+            tracker_counts.update({
+                'stop_boundary_excluded_events': stop_filter_stats['excluded_events'],
+                'stop_boundary_excluded_ocr_rows': stop_filter_stats['excluded_ocr_rows'],
+                'ocr_rows': len(ocr_rows),
+                'ocr_queue_drained': session_ocr_drained,
+                'dropped_ocr_crops': dropped_during,
+                'recording_duration_seconds': round(recording_length, 3),
+                'last_live_ocr_at_seconds': round(last_ocr, 3) if last_ocr is not None else None,
+                'recording_seconds_after_last_live_ocr': (
+                    round(max(0.0, recording_length - last_ocr), 3)
+                    if last_ocr is not None else None),
+            })
 
         path.mkdir(parents=True, exist_ok=True)
+        (path / 'live_tracking_quality.json').write_text(
+            json.dumps(tracker_counts, indent=2), encoding='utf-8')
         event_path = path / 'live_damage_events.csv'
         with event_path.open('w', newline='', encoding='utf-8') as f:
             w = csv.writer(f)
@@ -330,6 +425,14 @@ class ContinuousLiveEstimator(LiveEstimator):
                 'live_rolling_apm', 'window_attacks', 'parsed_attacks_total',
             ])
             w.writerows(live_rows)
+
+        # Publish a readiness marker only after both the full recognized-line
+        # log and all live metrics are flushed. Fast post-analysis waits for it.
+        write_log(path, ocr_rows, complete=session_ocr_drained,
+                  dropped=dropped_during, started_epoch=started_epoch,
+                  stopped_epoch=stopped_epoch,
+                  note=('Pre-stop OCR queue drained' if session_ocr_drained else
+                        'Pre-stop OCR backlog remained after 5s; quick results may be incomplete'))
 
     def _record_session_sample(self, continuous_dps, continuous_apm, qdepth):
         with self.session_lock:

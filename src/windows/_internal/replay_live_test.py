@@ -354,8 +354,11 @@ def run_replay(session: Path):
             else:
                 phase_delta = circular_phase_distance(phase, align_phase, est.line_height)
                 shift, score, zero, decision = estimate_shift_fast(
-                    align_feat, feat, est.line_height, est.max_shift_px
+                    align_feat, feat, est.line_height, est.max_shift_px,
+                    phase_offset=(align_phase - phase) % est.line_height,
                 )
+                if decision == "phase-corrected-positive" and shift > 0:
+                    est.phase_corrected_scrolls += 1
                 if decision == "uncertain->zero":
                     est.robust_fallback_runs += 1
                     (
@@ -462,7 +465,10 @@ def run_replay(session: Path):
                     est.anchor_hold_frames_total += 1
                     anchor_action = "hold"
                     decision += "+anchor-hold"
-                    if align_age_frames >= est.anchor_timeout_frames and phase_delta <= 1:
+                    if align_age_frames >= est.anchor_timeout_frames:
+                        if phase_delta > 1:
+                            est.anchor_phase_timeout_rebases += 1
+                            decision += "+phase-timeout"
                         align_gray = gray
                         align_feat = feat
                         align_phase = phase

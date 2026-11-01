@@ -29,6 +29,7 @@ CONFIG = HERE / "config.json"
 DEFAULT_LIVE_WINDOW_SECONDS = 15.0
 
 from cpu_utils import resolve_indra_threads
+from live_ocr_log import new_row, write_log
 
 OCR_DIGIT_MAP = str.maketrans({
     "S": "5",
@@ -334,31 +335,56 @@ def _shift_error(prev_feat, curr_feat, shift):
     return float(np.mean(np.abs(a.astype(np.int16) - b.astype(np.int16))))
 
 
-def estimate_shift_fast(prev_feat, curr_feat, line_height, max_shift_px):
-    # Require at least four text rows of overlap so very large shifts cannot win
-    # merely because only a tiny image strip remains to compare.
-    max_shift = min(max_shift_px, prev_feat.shape[0] - 4 * line_height)
-    max_shift = max(0, (max_shift // line_height) * line_height)
-    candidates = [(s, _shift_error(prev_feat, curr_feat, s))
-                  for s in range(0, max_shift + 1, line_height)]
+def estimate_shift_fast(prev_feat, curr_feat, line_height, max_shift_px, phase_offset=0):
+    """Find completed upward text-row scrolling, including sub-row phase shifts.
+
+    DDO often scrolls by one or more rows PLUS a few pixels.  The preceding
+    grid phase then differs from the current phase.  Restricting candidate
+    displacements to 0, line_height, 2*line_height, ... leaves a sticky visual
+    anchor stranded forever at the first such scroll.  Search the phase-
+    corrected displacements as well, without treating an unfinished (< one
+    complete line) animated movement as a new OCR row.
+    """
+    line_height = max(1, int(line_height))
+    phase_offset = int(phase_offset) % line_height
+    max_shift = min(int(max_shift_px), prev_feat.shape[0] - 4 * line_height)
+    max_shift = max(0, max_shift)
+
+    # Always compare the no-scroll reference, and explicitly TEST the
+    # incomplete sub-row displacement.  Without the partial candidate,
+    # scrolling by only 4px can resemble scrolling by 18px because adjacent
+    # combat lines share much of their text.  Never rebase on a partial row.
+    shifts = [0]
+    if 0 < phase_offset < line_height:
+        shifts.append(phase_offset)
+    shifts.extend(s for s in range(line_height, max_shift + 1)
+                  if s % line_height == phase_offset)
+    candidates = [(s, _shift_error(prev_feat, curr_feat, s)) for s in shifts]
     zero_error = candidates[0][1]
     best_shift, best_error = min(candidates, key=lambda x: x[1])
 
     if best_shift == 0:
         return 0, best_error, zero_error, "zero"
+    if best_shift < line_height:
+        return 0, best_error, zero_error, "partial-scroll->hold"
+    if phase_offset:
+        partial_error = candidates[1][1]
+        if partial_error <= best_error + max(0.25, best_error * 0.12):
+            return 0, best_error, zero_error, "ambiguous-partial->hold"
 
-    # A genuine scroll normally produces a dramatic error reduction. This
-    # relative test is intentionally conservative to avoid duplicate OCR lines.
+    # Require overwhelming alignment improvement.  This avoids inventing
+    # scrolls when new text was merely appended to a non-scrolling log.
     ratio = best_error / max(zero_error, 1e-6)
     if ratio > 0.62:
         return 0, best_error, zero_error, "uncertain->zero"
 
-    # If several shifts are nearly identical, prefer the smallest positive one.
     tolerance = max(0.25, best_error * 0.12)
     close = [(s, e) for s, e in candidates if s > 0 and e <= best_error + tolerance]
     if close:
         best_shift, best_error = min(close, key=lambda x: x[0])
-    return best_shift, best_error, zero_error, "positive"
+    return best_shift, best_error, zero_error, (
+        "phase-corrected-positive" if phase_offset else "positive"
+    )
 
 
 # Robust post-analysis alignment, used only as a second opinion when the cheap
@@ -783,6 +809,9 @@ class LiveEstimator:
         self.live_event_path = self.session / "live_damage_events.csv"
         self.live_event_records = []
         self.live_event_records_lock = threading.Lock()
+        self.live_ocr_records_lock = threading.Lock()
+        self.live_ocr_records = []
+        self.ocr_batch_inflight = ()
         self.live_raw_damage_total = 0
         self.live_corrected_damage_total = 0
         self.scan_path = Path(os.devnull)
@@ -826,6 +855,8 @@ class LiveEstimator:
         self.anchor_hold_frames_total = 0
         self.anchor_linewise_runs = 0
         self.anchor_linewise_overrides = 0
+        self.phase_corrected_scrolls = 0
+        self.anchor_phase_timeout_rebases = 0
 
         self.root = None
         self.overlay_canvas = None
@@ -922,7 +953,7 @@ class LiveEstimator:
             if pending is None:
                 return False
             elapsed = float(pending["elapsed"])
-            if max_elapsed is not None and elapsed > float(max_elapsed) + 0.05:
+            if max_elapsed is not None and elapsed > float(max_elapsed) + 1e-6:
                 return False
             crop = pending.get("partial_crop")
             self.pending_bottom_line = None
@@ -1021,6 +1052,22 @@ class LiveEstimator:
                 row[1] = f"{row[1]:.6f}"
                 row[2] = f"{row[2]:.6f}"
                 w.writerow(row)
+
+    def record_live_ocr_line(self, elapsed, raw, effective, amount,
+                             numeric_recheck, numeric_recheck_amount, event_elapsed):
+        """Save every Indra OCR output row (including non-damage and empty rows)."""
+        row = new_row(elapsed, self.start_epoch, raw, effective, amount,
+                      numeric_recheck, numeric_recheck_amount, event_elapsed)
+        with self.live_ocr_records_lock:
+            self.live_ocr_records.append(row)
+
+    def write_live_ocr_log(self):
+        with self.live_ocr_records_lock:
+            rows = list(self.live_ocr_records)
+        write_log(self.session, rows, complete=True,
+                  dropped=self.dropped_lines_total,
+                  started_epoch=self.start_epoch,
+                  note='All OCR outputs from captured line crops; dropped crops are counted separately.')
 
     def init_live_ocr_engine(self):
         """Load the persistent Indra OCR model used by live DPS."""
@@ -1132,6 +1179,7 @@ class LiveEstimator:
                     except queue.Empty:
                         break
 
+                self.ocr_batch_inflight = tuple(float(x[0]) for x in items)
                 t0 = time.perf_counter()
                 try:
                     texts = self.ocr_indra_batch(items)
@@ -1144,6 +1192,7 @@ class LiveEstimator:
                                 completion_event.set()
                         finally:
                             self.ocr_queue.task_done()
+                    self.ocr_batch_inflight = ()
                     self.stop_event.set()
                     break
 
@@ -1157,7 +1206,8 @@ class LiveEstimator:
                     accepted_for_live = float(elapsed) + 1e-6 >= live_accept_after
                     if accepted_for_live:
                         self.ocr_lines_total += 1
-                    text = normalize_text(text) if text else ""
+                    raw_ocr_text = normalize_text(text) if text else ""
+                    text = raw_ocr_text
                     # Full-height rows are never repaired here.  A crop shorter
                     # than the locked line height can only be the Stop/EOF
                     # fallback for a pending bottom fragment.  On the validated
@@ -1294,6 +1344,10 @@ class LiveEstimator:
                             self.attacks.append(elapsed)
                         self.parsed_attacks_total += 1
 
+                    self.record_live_ocr_line(
+                        elapsed, raw_ocr_text, text, amount,
+                        numeric_recheck, numeric_recheck_amount, event_elapsed
+                    )
                     scan_w.writerow([
                         f"{elapsed:.6f}",
                         f"{per_line_ms:.1f}",
@@ -1310,6 +1364,7 @@ class LiveEstimator:
                     self.ocr_queue.task_done()
                     if completion_event is not None:
                         completion_event.set()
+                self.ocr_batch_inflight = ()
                 scan_f.flush()
 
                 if self.ocr_lines_total == len(items) or self.ocr_lines_total % 10 < len(items):
@@ -1334,6 +1389,10 @@ class LiveEstimator:
             self.write_live_damage_events()
         except Exception as exc:
             self.update_queue.put(("error", f"Could not write live_damage_events.csv: {exc}"))
+        try:
+            self.write_live_ocr_log()
+        except Exception as exc:
+            self.update_queue.put(("error", f"Could not write live_ocr_lines.csv: {exc}"))
 
         self.write_status(ocr_worker_finished=True, ocr_queue_depth=self.ocr_queue.qsize())
 
@@ -1611,7 +1670,10 @@ class LiveEstimator:
                             feat,
                             self.line_height,
                             self.max_shift_px,
+                            phase_offset=(align_phase - phase) % self.line_height,
                         )
+                        if decision == "phase-corrected-positive" and shift > 0:
+                            self.phase_corrected_scrolls += 1
 
                         # FastAlignment remains the first fallback for ambiguous
                         # anchor comparisons.  The anchor may span several 30-fps
@@ -1742,8 +1804,14 @@ class LiveEstimator:
                             # never rebases in the middle of visible sub-line motion.
                             if (
                                 align_age_frames >= self.anchor_timeout_frames
-                                and phase_delta <= 1
                             ):
+                                # Last-resort recovery: never hold an obsolete
+                                # anchor indefinitely after a changed grid phase.
+                                # If we cannot match its scroll after two seconds,
+                                # rebase so subsequent text can be recovered.
+                                if phase_delta > 1:
+                                    self.anchor_phase_timeout_rebases += 1
+                                    decision += "+phase-timeout"
                                 align_gray = gray
                                 align_feat = feat
                                 align_phase = phase
@@ -1831,6 +1899,8 @@ class LiveEstimator:
                             bottom_dropped_total=self.bottom_dropped_total,
                             robust_fallback_runs=self.robust_fallback_runs,
                             robust_fallback_overrides=self.robust_fallback_overrides,
+                            phase_corrected_scrolls=self.phase_corrected_scrolls,
+                            anchor_phase_timeout_rebases=self.anchor_phase_timeout_rebases,
                         )
                         next_status = now2 + 1.0
 
