@@ -488,6 +488,82 @@ def estimate_shift_robust_live(prev_gray, curr_gray, line_height, max_shift_px, 
     return shift, chosen_score, zero, decision, confident, margin, second_score
 
 
+
+def circular_phase_distance(a, b, line_height):
+    """Smallest distance between two row-grid phases on a circular line-height scale."""
+    if a is None or b is None:
+        return int(line_height)
+    lh = max(1, int(line_height))
+    da = (int(a) - int(b)) % lh
+    db = (int(b) - int(a)) % lh
+    return int(min(da, db))
+
+
+def line_match_feature_live(crop):
+    """Feature used by the conservative live line-by-line fallback."""
+    blur = cv2.GaussianBlur(crop, (0, 0), 1.4)
+    high = cv2.absdiff(crop, blur)
+    if high.shape[1] > 40:
+        high = high[:, 15:-15]
+    _, high = cv2.threshold(high, 10, 255, cv2.THRESH_TOZERO)
+    return high.astype(np.float32) / 255.0
+
+
+def cosine_live(a, b):
+    if a.shape != b.shape or a.size == 0:
+        return 0.0
+    af = a.reshape(-1)
+    bf = b.reshape(-1)
+    denom = float(np.linalg.norm(af) * np.linalg.norm(bf))
+    if denom < 1e-9:
+        return 0.0
+    return float(np.dot(af, bf) / denom)
+
+
+def estimate_shift_linewise_live(prev_gray, curr_gray, prev_phase, curr_phase, line_height, max_shift_px):
+    """Conservative line-by-line fallback for an ambiguous completed scroll.
+
+    This is intentionally used only when the sticky alignment anchor has changed
+    visually but the fast whole-frame matcher still reports zero.  It is not on
+    the normal 30-fps path.
+    """
+    prev_cells = line_cells(prev_gray, prev_phase, line_height)
+    curr_cells = line_cells(curr_gray, curr_phase, line_height)
+    if len(prev_cells) < 6 or len(curr_cells) < 6:
+        return 0, 0.0, 0.0, False
+
+    prev_feats = [line_match_feature_live(prev_gray[y0:y1]) for y0, y1 in prev_cells]
+    curr_feats = [line_match_feature_live(curr_gray[y0:y1]) for y0, y1 in curr_cells]
+
+    max_lines = min(int(max_shift_px // line_height), len(prev_feats) - 4)
+    candidates = []
+    for shift_lines in range(max_lines + 1):
+        overlap = min(len(prev_feats) - shift_lines, len(curr_feats))
+        if overlap < 4:
+            continue
+        sims = [
+            cosine_live(prev_feats[j + shift_lines], curr_feats[j])
+            for j in range(overlap)
+        ]
+        score = float(np.mean(sims)) if sims else 0.0
+        strong = sum(1 for x in sims if x >= 0.94)
+        candidates.append((score, strong, overlap, shift_lines))
+
+    if not candidates:
+        return 0, 0.0, 0.0, False
+
+    candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    best = candidates[0]
+    second_score = candidates[1][0] if len(candidates) > 1 else 0.0
+    best_score, strong, overlap, shift_lines = best
+    required_strong = max(4, int(round(overlap * 0.55)))
+    confident = bool(
+        best_score >= 0.94
+        and strong >= required_strong
+        and (best_score - second_score) >= 0.015
+    )
+    return shift_lines * line_height, best_score, second_score, confident
+
 def line_cells(gray, phase, line_height):
     h = gray.shape[0]
     cells = []
@@ -710,7 +786,9 @@ class LiveEstimator:
         self.live_raw_damage_total = 0
         self.live_corrected_damage_total = 0
         self.scan_path = Path(os.devnull)
-        self.track_path = Path(os.devnull)
+        # Test build: persist lightweight 30-fps tracking diagnostics so live
+        # reconstruction can be compared directly with post-analysis.
+        self.track_path = self.session / "live_tracking.csv"
         self.status_path = None
         self.overlay_error_path = self.session / "live_overlay_error.txt"
 
@@ -741,6 +819,13 @@ class LiveEstimator:
         self.tracking_frames = 0
         self.tracking_late_frames = 0
         self.tracking_max_lateness_ms = 0.0
+        # A sticky visual anchor prevents smooth sub-line DDO scroll animation
+        # from being lost when consecutive 30-fps frames move only a few pixels.
+        self.anchor_zero_rebase_error = float(self.live_cfg.get("anchor_zero_rebase_error", 0.75))
+        self.anchor_timeout_frames = max(30, int(self.live_cfg.get("anchor_timeout_frames", self.tracking_fps * 2)))
+        self.anchor_hold_frames_total = 0
+        self.anchor_linewise_runs = 0
+        self.anchor_linewise_overrides = 0
 
         self.root = None
         self.overlay_canvas = None
@@ -1309,6 +1394,10 @@ class LiveEstimator:
                 "zero_score",
                 "decision",
                 "grid_phase",
+                "anchor_phase",
+                "phase_delta",
+                "anchor_age_frames",
+                "anchor_action",
                 "linewise_shift_px",
                 "linewise_score",
                 "linewise_second_score",
@@ -1326,6 +1415,13 @@ class LiveEstimator:
             prev_feat = None
             prev_phase = None
             last_phase = None
+            # Immediate previous frame is kept for append-only detection.
+            # Alignment uses a separate sticky anchor that is NOT advanced by
+            # partial-line scroll animation.
+            align_gray = None
+            align_feat = None
+            align_phase = None
+            align_age_frames = 0
 
             baseline_path = self.session / "baseline_gray.png"
             if baseline_path.exists():
@@ -1339,11 +1435,19 @@ class LiveEstimator:
                         prev_feat = fast_text_feature(bgray)
                         prev_phase = best_grid_phase_from_feature(prev_feat, self.line_height)
                         last_phase = prev_phase
+                        align_gray = bgray
+                        align_feat = prev_feat
+                        align_phase = prev_phase
+                        align_age_frames = 0
                 except Exception:
                     prev_gray = None
                     prev_feat = None
                     prev_phase = None
                     last_phase = None
+                    align_gray = None
+                    align_feat = None
+                    align_phase = None
+                    align_age_frames = 0
 
             next_deadline = time.perf_counter()
             next_live_sample = next_deadline
@@ -1390,6 +1494,10 @@ class LiveEstimator:
                         prev_feat = None
                         prev_phase = None
                         last_phase = None
+                        align_gray = None
+                        align_feat = None
+                        align_phase = None
+                        align_age_frames = 0
                         self.clear_pending_bottom_line(count_drop=True)
 
                         now2 = time.perf_counter()
@@ -1419,6 +1527,10 @@ class LiveEstimator:
                         prev_feat = None
                         prev_phase = None
                         last_phase = None
+                        align_gray = None
+                        align_feat = None
+                        align_phase = None
+                        align_age_frames = 0
                         self.write_status(capture_paused_no_ddo_focus=False)
 
                     shot = sct.grab(region)
@@ -1447,6 +1559,10 @@ class LiveEstimator:
                                     prev_feat = None
                                     prev_phase = None
                                     last_phase = None
+                                    align_gray = None
+                                    align_feat = None
+                                    align_phase = None
+                                    align_age_frames = 0
                                     self.clear_pending_bottom_line(count_drop=True)
                                 self.line_height_locked = True
 
@@ -1468,30 +1584,40 @@ class LiveEstimator:
                     robust_second = 0.0
                     robust_confident = False
                     robust_override = False
-                    if prev_gray is None:
+                    lw_shift = 0
+                    lw_score = 0.0
+                    lw_second = 0.0
+                    lw_confident = False
+                    anchor_action = ""
+                    phase_delta = 0
+
+                    if align_gray is None:
                         shift = 0
                         score = 1.0
                         zero = 1.0
                         decision = "baseline"
-                        lw_shift = 0
-                        lw_score = 1.0
-                        lw_second = 0.0
                         crops = []
+                        align_gray = gray
+                        align_feat = feat
+                        align_phase = phase
+                        align_age_frames = 0
+                        anchor_action = "baseline"
                     else:
+                        phase_delta = circular_phase_distance(
+                            phase, align_phase, self.line_height
+                        )
                         shift, score, zero, decision = estimate_shift_fast(
-                            prev_feat,
+                            align_feat,
                             feat,
                             self.line_height,
                             self.max_shift_px,
                         )
-                        lw_shift = 0
-                        lw_score = 0.0
-                        lw_second = 0.0
 
-                        # Second opinion only for ambiguous live frames.  Keep
-                        # the cheap matcher on the 30-fps fast path, and let the
-                        # robust post-analysis matcher override only when it is
-                        # itself confidently positive.
+                        # FastAlignment remains the first fallback for ambiguous
+                        # anchor comparisons.  The anchor may span several 30-fps
+                        # frames while DDO animates one text row a few pixels at a
+                        # time, so it compares against align_gray rather than the
+                        # immediately previous frame.
                         if decision == "uncertain->zero":
                             self.robust_fallback_runs += 1
                             (
@@ -1499,7 +1625,7 @@ class LiveEstimator:
                                 robust_decision, robust_confident,
                                 _robust_margin, robust_second,
                             ) = estimate_shift_robust_live(
-                                prev_gray,
+                                align_gray,
                                 gray,
                                 self.line_height,
                                 self.max_shift_px,
@@ -1512,6 +1638,34 @@ class LiveEstimator:
                                 self.robust_fallback_overrides += 1
                             else:
                                 decision += "+robust-keep-zero"
+
+                        # If the visual anchor changed substantially but the
+                        # whole-frame matcher still says zero, verify completed
+                        # whole-row scrolling line-by-line.  This is deliberately
+                        # restricted to near-matching grid phases so it does not
+                        # run on every intermediate animation frame.
+                        if (
+                            shift == 0
+                            and phase_delta <= 1
+                            and zero > self.anchor_zero_rebase_error
+                        ):
+                            self.anchor_linewise_runs += 1
+                            (
+                                lw_shift, lw_score, lw_second, lw_confident
+                            ) = estimate_shift_linewise_live(
+                                align_gray,
+                                gray,
+                                align_phase,
+                                phase,
+                                self.line_height,
+                                self.max_shift_px,
+                            )
+                            if lw_confident and lw_shift > 0:
+                                shift = int(lw_shift)
+                                decision += "+linewise-positive"
+                                self.anchor_linewise_overrides += 1
+                            elif lw_confident:
+                                decision += "+linewise-zero"
 
                         crop_entries = []  # (elapsed, crop)
                         recovered = self.recover_pending_bottom_line(gray, feat, shift)
@@ -1527,7 +1681,14 @@ class LiveEstimator:
                             if self.defer_pending_bottom_line(gray, deferred_y0, elapsed):
                                 decision += "+defer-bottom"
 
-                        if not crop_entries and shift == 0 and prev_phase == phase:
+                        # Append-only detection still compares consecutive frames;
+                        # it is independent of the sticky scroll anchor.
+                        if (
+                            not crop_entries
+                            and shift == 0
+                            and prev_feat is not None
+                            and prev_phase == phase
+                        ):
                             append_crops = crop_blank_to_filled_lines(
                                 prev_feat, gray, feat, phase, self.line_height
                             )
@@ -1539,6 +1700,57 @@ class LiveEstimator:
                             self.enqueue_new_lines([crop], crop_elapsed)
                         crops = [crop for _crop_elapsed, crop in crop_entries]
 
+                        # IMPORTANT: do not automatically make every 30-fps frame
+                        # the next alignment reference.  During DDO's smooth chat
+                        # scroll, consecutive frames can move only 2-6 pixels. The
+                        # old code rebased on those zero-shift frames and therefore
+                        # never accumulated a full line_height movement.  Hold the
+                        # anchor until a complete row is visible, an append-only
+                        # change is confirmed, or the frame is essentially static.
+                        if shift > 0:
+                            align_gray = gray
+                            align_feat = feat
+                            align_phase = phase
+                            align_age_frames = 0
+                            anchor_action = "scroll-rebase"
+                        elif "+append" in decision:
+                            align_gray = gray
+                            align_feat = feat
+                            align_phase = phase
+                            align_age_frames = 0
+                            anchor_action = "append-rebase"
+                        elif lw_confident and lw_shift == 0:
+                            align_gray = gray
+                            align_feat = feat
+                            align_phase = phase
+                            align_age_frames = 0
+                            anchor_action = "linewise-zero-rebase"
+                        elif phase_delta == 0 and zero <= self.anchor_zero_rebase_error:
+                            align_gray = gray
+                            align_feat = feat
+                            align_phase = phase
+                            align_age_frames = 0
+                            anchor_action = "static-rebase"
+                        else:
+                            align_age_frames += 1
+                            self.anchor_hold_frames_total += 1
+                            anchor_action = "hold"
+                            decision += "+anchor-hold"
+                            # Safety valve only after a long unresolved period and
+                            # only when the row grid has returned to the anchor
+                            # phase. This avoids a permanently stale reference but
+                            # never rebases in the middle of visible sub-line motion.
+                            if (
+                                align_age_frames >= self.anchor_timeout_frames
+                                and phase_delta <= 1
+                            ):
+                                align_gray = gray
+                                align_feat = feat
+                                align_phase = phase
+                                align_age_frames = 0
+                                anchor_action = "timeout-rebase"
+                                decision += "+anchor-timeout-rebase"
+
                     track_w.writerow([
                         self.tracking_frames,
                         f"{elapsed:.6f}",
@@ -1548,6 +1760,10 @@ class LiveEstimator:
                         f"{zero:.5f}",
                         decision,
                         phase,
+                        "" if align_phase is None else align_phase,
+                        phase_delta,
+                        align_age_frames,
+                        anchor_action,
                         lw_shift,
                         f"{lw_score:.5f}",
                         f"{lw_second:.5f}",
