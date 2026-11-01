@@ -22,6 +22,9 @@ HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
 
 from cpu_utils import physical_core_count, resolve_indra_threads
+from post_numeric_guard import NumericGuard
+from live_ocr_log import read_log
+from live_post_diagnostics import reconcile
 
 
 # ---------------------------------------------------------------------------
@@ -875,31 +878,129 @@ def join_damage_wrap(prefix, continuation, kind=None):
     return None
 
 
-def reassemble_wrapped_damage_rows(texts, line_times=None):
-    """Recover only safe two-row wrapped damage messages.
+# Incoming visual wraps are handled only when the first row explicitly
+# refers to damage suffered by the player and the next row has no Combat
+# prefix. That prevents unrelated damage lines from being swallowed.
+INCOMING_INDICATOR_RE = re.compile(
+    r"(?:\bhits?\s+you\b|\bYou\s+(?:were|are)\s+hit\s+by\b|"
+    r"\bYou\s+(?:take|suffer)\b)", re.IGNORECASE
+)
 
-    Every ordinary OCR row remains independent.  Only a row that ends in an
-    unmistakably incomplete outgoing-damage prefix may consume the immediately
-    following row.  The first row's timestamp/line number is retained.
-    """
+
+def incoming_wrap_kind(line):
+    if not INCOMING_INDICATOR_RE.search(line):
+        return None
+    tail = line.strip().rstrip('.!')
+    if re.search(r"\bblocked\s+by\s+(?:energy|damage)\s*$", tail, re.I):
+        return 'resistance_tail'
+    if re.search(r"\bblocked\s+by\s*$", tail, re.I):
+        return 'blocked_by_tail'
+    if re.search(r"\b(?:were|was)\s+blocked\s*$", tail, re.I):
+        return 'blocked_no_by_tail'
+    if re.search(r"\bdamage\s+after\s+[0-9,SOsoIl|]+\s+(?:were|was)\s*$", tail, re.I):
+        return 'blocked_tail'
+    if re.search(r"\bdamage\s+from\s*$", tail, re.I):
+        return 'damage_from_tail'
+    if re.search(r"\bhits?\s+you\s*$", tail, re.I):
+        return 'hit_tail'
+    if re.search(r"\bfor\s+a\s*$", tail, re.I):
+        return 'for_a_tail'
+    if re.search(r"\bfor\s*(?:a\s+total\s+of\s*)?$", tail, re.I):
+        return 'amount_tail'
+    if re.search(r"\bpoints?\s*$", tail, re.I):
+        return 'points_tail'
+    if re.search(r"\bfor\s+(?:a\s+total\s+of\s*)?[0-9,SOsoIl|]+\s*$", tail, re.I):
+        return 'numeric_tail'
+    if re.search(r"\bpoints?\s+of\s*$", tail, re.I):
+        return 'bare_tail'
+    if re.search(r"\bpoints?\s+of\s+[A-Za-z][A-Za-z -]*?$", tail, re.I):
+        if re.search(r"\bpoints?\s+of\s+damage\s*$", tail, re.I):
+            return None
+        return 'type_tail'
+    return None
+
+
+def join_incoming_wrap(prefix, continuation, kind):
+    cont = _clean_continuation_row(continuation)
+    if not cont or COMBAT_MESSAGE_START_RE.match(cont):
+        return None
+    rules = {
+        'resistance_tail': r'^(?:resistance|reduction)\b',
+        'blocked_by_tail': r'^(?:energy|damage|[A-Za-z][A-Za-z -]{0,15})\s+(?:resistance|reduction)\b',
+        'blocked_no_by_tail': r'^by\s+(?:energy|damage)\s+(?:resistance|reduction)\b',
+        'blocked_tail': r'^blocked\s+by\b',
+        'damage_from_tail': r'^(?:Trap:)?[A-Za-z][A-Za-z: -]*\b',
+        'hit_tail': r'^for\s+(?:a\s+total\s+of\s*)?[0-9,SOsoIl|]+\b',
+        'for_a_tail': r'^total\s+of\s+[0-9,SOsoIl|]+\b',
+        'amount_tail': rf'^{NUM_TOKEN}\s+points?\s+of\b',
+        'numeric_tail': r'^points?\s+of\b',
+        'points_tail': r'^of\s+(?:[A-Za-z][A-Za-z -]*?\s+)?damage\b',
+        'bare_tail': r'^[A-Za-z][A-Za-z -]*?\s+damage\b',
+        'type_tail': r'^damage\b',
+    }
+    if not re.match(rules.get(kind, r'a^'), cont, re.I):
+        return None
+    joined = normalize_text(prefix + ' ' + cont)
+    # A still incomplete 3-row message is safe to keep joining, but never
+    # attach a new Combat-prefixed message or a random next visual row.
+    if incoming_wrap_kind(joined):
+        return joined
+    if kind in ('resistance_tail','blocked_tail','blocked_by_tail','blocked_no_by_tail'):
+        return joined
+    if (IN_HIT_RE.search(joined) or IN_WERE_HIT_RE.search(joined) or
+            IN_TAKE_RE.search(joined) or IN_SUFFER_RE.search(joined) or
+            IN_SUFFER_TRAP_RE.search(joined) or IN_UNTYPED_RE.search(joined)):
+        return joined
+    return None
+
+
+def reassemble_wrapped_damage_rows(texts, line_times=None, stats=None):
+    """Recover safe outgoing/incoming wraps, keeping original first-row times."""
     out_texts, out_times, out_lines = [], [], []
     i = 0
+    outgoing_joins = incoming_joins = 0
+    joined_incoming_messages = 0
     while i < len(texts):
         line = normalize_text(texts[i])
         elapsed = line_times[i] if line_times is not None and i < len(line_times) else None
-        kind = damage_wrap_kind(line)
-        if kind and i + 1 < len(texts):
-            joined = join_damage_wrap(line, texts[i + 1], kind)
-            if joined:
-                out_texts.append(joined)
-                out_times.append(elapsed)
-                out_lines.append(i + 1)
-                i += 2
-                continue
+        count = 1
+        if i + count < len(texts):
+            nxt = normalize_text(texts[i + count])
+            if not COMBAT_MESSAGE_START_RE.match(nxt):
+                outgoing_kind = damage_wrap_kind(line)
+                if outgoing_kind:
+                    joined = join_damage_wrap(line, nxt, outgoing_kind)
+                    if joined:
+                        line = joined
+                        count += 1
+                        outgoing_joins += 1
+        # Incoming damage, including 3-row wraps caused by long effects and
+        # resistance messages. At most three extra rows may be consumed.
+        inc_joined = False
+        while i + count < len(texts) and count < 4:
+            kind = incoming_wrap_kind(line)
+            if not kind:
+                break
+            next_line = normalize_text(texts[i + count])
+            if COMBAT_MESSAGE_START_RE.match(next_line):
+                break
+            joined = join_incoming_wrap(line, next_line, kind)
+            if joined is None:
+                break
+            line = joined
+            count += 1
+            incoming_joins += 1
+            inc_joined = True
+        if inc_joined:
+            joined_incoming_messages += 1
         out_texts.append(line)
         out_times.append(elapsed)
         out_lines.append(i + 1)
-        i += 1
+        i += count
+    if stats is not None:
+        stats['outgoing_wraps'] = outgoing_joins
+        stats['incoming_wraps'] = incoming_joins
+        stats['incoming_messages_recovered'] = joined_incoming_messages
     return out_texts, out_times, out_lines
 
 HEAL_TARGET_RE = re.compile(
@@ -923,11 +1024,25 @@ IN_HIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+IN_UNTYPED_RE = re.compile(
+    rf"(?:\(Combat\):\s*)?"
+    rf"(?P<source>.+?)\s+(?:hit|hits)\s+you\s+for\s+"
+    rf"(?:a\s+total\s+of\s+)?(?P<amount>{NUM_TOKEN})\s+points?\s+of\s+damage\b",
+    re.IGNORECASE,
+)
+
 IN_WERE_HIT_RE = re.compile(
     rf"\bYou\s+(?:were|are)\s+hit\s+by\s+(?P<source>.+?)\s+for\s+"
     rf"(?:a\s+total\s+of\s+)?(?P<amount>{NUM_TOKEN})\s+points?\s+of\s+"
     rf"(?P<dtype>[A-Za-z][A-Za-z -]*?)\s+damage\b",
     re.IGNORECASE,
+)
+
+IN_SUFFER_TRAP_RE = re.compile(
+    rf"\bYou\s+suffer\s+(?:a\s+total\s+of\s+)?"
+    rf"(?P<amount>{NUM_TOKEN})\s+points?\s+of\s+damage\s+from\s+"
+    rf"Trap\s*:\s*(?P<dtype>[A-Za-z][A-Za-z -]*?)"
+    rf"(?=\s+after\b|[.!]|$)", re.IGNORECASE,
 )
 
 IN_SUFFER_RE = re.compile(
@@ -986,7 +1101,7 @@ def canonical_target(s):
 
 
 COMBAT_MESSAGE_START_RE = re.compile(
-    r"^\s*[|\[\]{}Il:;`'.,_-]{0,3}\s*\(?\s*Combat\s*\)?\s*:",
+    r"^\s*[|\[\]{}Il1:;`'\".,_\-„“”]{0,3}\s*\(?\s*Combat\s*\)?\s*:",
     re.IGNORECASE,
 )
 
@@ -1054,15 +1169,18 @@ def reassemble_wrapped_combat_messages(texts, line_times=None):
     return messages, times, source_lines
 
 
-def parse_blocked_amount(line):
+def parse_blocked_amount(line, resolver=None, line_no=None):
     m = BLOCKED_AFTER_RE.search(line)
     if not m:
         return 0, "", "", False
-    value, raw, corrected, changed = parse_ocr_number(m.group("blocked"))
+    value, raw, corrected, changed = (
+        resolver(m.group("blocked"), "blocked_damage", line_no, line)
+        if resolver is not None else parse_ocr_number(m.group("blocked"))
+    )
     return (int(value or 0), raw, corrected, changed)
 
 
-def parse_combat_events(texts, line_times=None, line_numbers=None):
+def parse_combat_events(texts, line_times=None, line_numbers=None, resolver=None):
     outgoing = []
     incoming = []
     healing = []
@@ -1076,6 +1194,8 @@ def parse_combat_events(texts, line_times=None, line_numbers=None):
             else idx + 1
         )
         parsed = False
+        def numeric(token, field):
+            return resolver(token, field, line_no, line) if resolver else parse_ocr_number(token)
         elapsed_seconds = None
         if line_times is not None and idx < len(line_times):
             elapsed_seconds = line_times[idx]
@@ -1086,11 +1206,11 @@ def parse_combat_events(texts, line_times=None, line_numbers=None):
             m = OUT_UNTYPED_RE.search(line)
             untyped = m is not None
         if m:
-            value, raw, corrected, changed = parse_ocr_number(m.group("amount"))
+            value, raw, corrected, changed = numeric(m.group("amount"), "damage")
             if value is not None:
                 mode = "sneak" if "sneak" in m.group("kind").lower() else "regular"
                 target = canonical_target(m.group("target"))
-                blocked, blocked_raw, blocked_corrected, blocked_changed = parse_blocked_amount(line)
+                blocked, blocked_raw, blocked_corrected, blocked_changed = parse_blocked_amount(line, resolver, line_no)
                 damage_type = "untyped" if untyped else clean_damage_type(m.group("dtype"))
                 reduction_type, reduction_class = parse_reduction_type(line, damage_type)
                 event = {
@@ -1129,7 +1249,7 @@ def parse_combat_events(texts, line_times=None, line_numbers=None):
         if not parsed:
             zm = ZERO_BLOCKED_OUT_RE.search(line)
             if zm:
-                blocked, braw, bcorr, bchanged = parse_ocr_number(zm.group("blocked"))
+                blocked, braw, bcorr, bchanged = numeric(zm.group("blocked"), "blocked_damage")
                 if blocked is not None:
                     mode = "sneak" if "sneak" in zm.group("kind").lower() else "regular"
                     zero_reason = zm.groupdict().get("reason") or ""
@@ -1153,7 +1273,7 @@ def parse_combat_events(texts, line_times=None, line_numbers=None):
         if not parsed:
             m = HEAL_TARGET_RE.search(line) or YOU_HEAL_RE.search(line)
             if m:
-                value, raw, corrected, changed = parse_ocr_number(m.group("amount"))
+                value, raw, corrected, changed = numeric(m.group("amount"), "healing")
                 if value is not None:
                     target = canonical_target(m.group("target"))
                     healing.append({
@@ -1177,10 +1297,11 @@ def parse_combat_events(texts, line_times=None, line_numbers=None):
                     parsed = True
 
         if not parsed:
-            m = IN_HIT_RE.search(line) or IN_WERE_HIT_RE.search(line)
+            m = IN_HIT_RE.search(line) or IN_WERE_HIT_RE.search(line) or IN_UNTYPED_RE.search(line)
             if m:
-                value, raw, corrected, changed = parse_ocr_number(m.group("amount"))
+                value, raw, corrected, changed = numeric(m.group("amount"), "incoming_damage")
                 if value is not None:
+                    blocked = parse_blocked_amount(line, resolver, line_no)[0]
                     incoming.append({
                         "line": line_no,
                         "elapsed_seconds": elapsed_seconds,
@@ -1188,12 +1309,12 @@ def parse_combat_events(texts, line_times=None, line_numbers=None):
                         "mode": "",
                         "source": canonical_target(m.group("source")),
                         "target": "You",
-                        "damage_type": clean_damage_type(m.group("dtype")),
+                        "damage_type": clean_damage_type(m.groupdict().get("dtype") or "untyped"),
                         "amount": value,
-                        "blocked_amount": parse_blocked_amount(line)[0],
-                        "pre_mitigation_amount": value + parse_blocked_amount(line)[0],
-                        "reduction_type": parse_reduction_type(line, clean_damage_type(m.group("dtype")))[0],
-                        "reduction_class": parse_reduction_type(line, clean_damage_type(m.group("dtype")))[1],
+                        "blocked_amount": blocked,
+                        "pre_mitigation_amount": value + blocked,
+                        "reduction_type": parse_reduction_type(line, clean_damage_type(m.groupdict().get("dtype") or "untyped"))[0],
+                        "reduction_class": parse_reduction_type(line, clean_damage_type(m.groupdict().get("dtype") or "untyped"))[1],
                         "ocr_token": raw,
                         "parsed_token": corrected,
                         "text": line,
@@ -1209,10 +1330,11 @@ def parse_combat_events(texts, line_times=None, line_numbers=None):
                     parsed = True
 
         if not parsed:
-            m = IN_SUFFER_RE.search(line) or IN_TAKE_RE.search(line)
+            m = IN_SUFFER_TRAP_RE.search(line) or IN_SUFFER_RE.search(line) or IN_TAKE_RE.search(line)
             if m:
-                value, raw, corrected, changed = parse_ocr_number(m.group("amount"))
+                value, raw, corrected, changed = numeric(m.group("amount"), "incoming_damage")
                 if value is not None:
+                    blocked = parse_blocked_amount(line, resolver, line_no)[0]
                     incoming.append({
                         "line": line_no,
                         "elapsed_seconds": elapsed_seconds,
@@ -1222,10 +1344,10 @@ def parse_combat_events(texts, line_times=None, line_numbers=None):
                         "target": "You",
                         "damage_type": clean_damage_type(m.group("dtype")),
                         "amount": value,
-                        "blocked_amount": parse_blocked_amount(line)[0],
-                        "pre_mitigation_amount": value + parse_blocked_amount(line)[0],
-                        "reduction_type": parse_reduction_type(line, clean_damage_type(m.group("dtype")))[0],
-                        "reduction_class": parse_reduction_type(line, clean_damage_type(m.group("dtype")))[1],
+                        "blocked_amount": blocked,
+                        "pre_mitigation_amount": value + blocked,
+                        "reduction_type": parse_reduction_type(line, clean_damage_type(m.groupdict().get("dtype") or "untyped"))[0],
+                        "reduction_class": parse_reduction_type(line, clean_damage_type(m.groupdict().get("dtype") or "untyped"))[1],
                         "ocr_token": raw,
                         "parsed_token": corrected,
                         "text": line,
@@ -3130,6 +3252,14 @@ def main():
     log_write_t0 = time.perf_counter()
     log_path = session / "combat_log.txt"
     log_path.write_text("\n".join(texts) + "\n", encoding="utf-8")
+    # Preserve timestamps of every independently reconstructed FFV1 OCR row.
+    # The quick/live OCR text remains in live_ocr_lines.csv, so line-level
+    # coverage can be compared without recomputing the expensive video OCR.
+    with (session / 'post_ocr_lines.csv').open('w',newline='',encoding='utf-8') as f:
+        writer = csv.writer(f)
+        writer.writerow(['line_number','capture_elapsed_seconds','ocr_text'])
+        for idx, (timestamp,text_line) in enumerate(zip(line_times,texts),1):
+            writer.writerow([idx, timestamp if timestamp is not None else '', text_line])
     timings.append(("combat_log_write", time.perf_counter() - log_write_t0))
     timing_details["combat_log_write"] = f"ocr_lines={len(texts)}"
 
@@ -3147,16 +3277,28 @@ def main():
                 damage_source_texts[eof_idx] = normalize_eof_partial_damage_row(
                     damage_source_texts[eof_idx], prior_texts
                 )
+    wrap_stats = {}
     damage_texts, damage_times, damage_line_numbers = reassemble_wrapped_damage_rows(
-        damage_source_texts, line_times
+        damage_source_texts, line_times, stats=wrap_stats
     )
+    guard = NumericGuard(converter=converter, crops=visual_lines, source_rows=texts)
     outgoing, incoming, healing, corrections, suspicious = parse_combat_events(
-        damage_texts, damage_times, damage_line_numbers
+        damage_texts, damage_times, damage_line_numbers, resolver=guard.resolve
     )
-    timings.append(("damage_healing_parse", time.perf_counter() - damage_parse_t0))
+    guard.save(session / 'post_numeric_validation.csv')
+    shutil.copy2(session / 'post_numeric_validation.csv', session / 'ffv1_post_numeric_validation.csv')
+    parse_total_seconds = time.perf_counter() - damage_parse_t0
+    timings.append(("damage_healing_parse", max(0.0, parse_total_seconds - guard.ocr_seconds)))
+    timings.append(("numeric_verification_ocr", guard.ocr_seconds))
+    timing_details['numeric_verification_ocr'] = (
+        f"extra Indra OCR seconds on suspect numeric fields; "
+        f"rechecked_lines={len(guard._recheck_cache)}")
     timing_details["damage_healing_parse"] = (
         f"outgoing={len(outgoing)}; incoming={len(incoming)}; healing={len(healing)}; "
-        f"suspicious={len(suspicious)}; eof_partial_rows={len(eof_partial_line_indices)}"
+        f"suspicious={len(suspicious)}; eof_partial_rows={len(eof_partial_line_indices)}; "
+        f"numeric_rejected={guard.stats.get('rejected', 0)}; "
+        f"incoming_wraps={wrap_stats.get('incoming_wraps', 0)}; "
+        f"numeric_verification_ocr_seconds={guard.ocr_seconds:.3f}"
     )
 
     attack_parse_t0 = time.perf_counter()
@@ -3182,8 +3324,19 @@ def main():
         session, texts, outgoing, incoming, healing, attacks, confirms, defensive_misses,
         corrections, suspicious, frame_no, len(visual_lines)
     )
+    # FFV1 is the independent post reference. Preserve its event-level output
+    # separately from the earlier instant/live-derived report.
+    shutil.copy2(session / 'damage_events.csv', session / 'ffv1_post_damage_events.csv')
+    shutil.copy2(session / 'COMBAT_REPORT.txt', session / 'ffv1_post_COMBAT_REPORT.txt')
+    summary_path = session / 'analysis_summary.json'
+    analysis_summary = json.loads(summary_path.read_text(encoding='utf-8'))
+    analysis_summary['analysis_source'] = 'ffv1_post'
+    analysis_summary['data_quality']['numeric_validation'] = guard.stats
+    analysis_summary['data_quality']['wrapped_damage_rows'] = wrap_stats
+    summary_path.write_text(json.dumps(analysis_summary, indent=2), encoding='utf-8')
+    reconcile(session, source='ffv1_post', wrap_stats=wrap_stats, guard_stats=guard.stats)
     timings.append(("report_and_graph_generation", time.perf_counter() - report_t0))
-    timing_details["report_and_graph_generation"] = "CSV/TXT reports and DPS graph data"
+    timing_details["report_and_graph_generation"] = "CSV/TXT, FFV1 snapshot and live/post event diagnostics"
 
     cleanup_t0 = time.perf_counter()
     # Keep the share build clean: remove post-analysis diagnostic artifacts.
@@ -3211,5 +3364,107 @@ def main():
     print("Analysis complete.", flush=True)
 
 
+
+def _fast_live_analysis(session, log_rows, log_metadata):
+    """Full reports from timestamped live OCR, without decoding FFV1 video."""
+    t0 = time.perf_counter()
+    times = []
+    texts = []
+    for row in log_rows:
+        try:
+            ts = float(row.get('capture_elapsed_seconds', ''))
+        except (ValueError, TypeError):
+            continue
+        text = normalize_text(row.get('effective_ocr_text') or row.get('raw_ocr_text') or '')
+        times.append(max(0.0, ts))
+        texts.append(text)
+    (session / 'combat_log_live.txt').write_text('\n'.join(texts) + '\n', encoding='utf-8')
+    # The GUI's no-activity check expects combat_log.txt. Do not overwrite an
+    # independent FFV1 OCR file if the user later runs the quick parser again.
+    if not (session / 'ffv1_post_damage_events.csv').exists():
+        (session / 'combat_log.txt').write_text('\n'.join(texts) + '\n', encoding='utf-8')
+    print(f'Live OCR ready: {len(texts)} lines; complete={log_metadata.get("capture_ocr_complete")}', flush=True)
+    print('PROGRESS|PREPARE|1|1', flush=True)
+    wrap_stats = {}
+    messages, message_times, message_lines = reassemble_wrapped_damage_rows(texts, times, stats=wrap_stats)
+    # Map successful live numeric checks to the source OCR row. For two-line
+    # wraps the verification belongs to the first row's event capture time.
+    by_capture = {}
+    for i, row in enumerate(log_rows):
+        try:
+            event_t = float(row.get('event_capture_elapsed_seconds',''))
+        except (ValueError, TypeError):
+            continue
+        result = row.get('numeric_recheck_result', '')
+        amount = row.get('parsed_outgoing_damage', '')
+        if result and amount not in ('', None):
+            by_capture[round(event_t, 4)] = {'result':result, 'final':amount}
+    trusted = {i+1: by_capture[round(ts, 4)] for i,ts in enumerate(times)
+               if round(ts, 4) in by_capture}
+    guard = NumericGuard(trusted_live=trusted)
+    outgoing, incoming, healing, corrections, suspicious = parse_combat_events(
+        messages, message_times, message_lines, resolver=guard.resolve)
+    guard.save(session / 'post_numeric_validation.csv')
+    shutil.copy2(session / 'post_numeric_validation.csv', session / 'fast_live_numeric_validation.csv')
+    print('PROGRESS|OCR|1|1', flush=True)
+    logical, logical_times, logical_lines = reassemble_wrapped_combat_messages(texts, times)
+    attacks, confirms = parse_attack_crit_events(logical, logical_times, logical_lines)
+    defensive_misses = parse_incoming_defense_events(texts, times, list(range(1,len(texts)+1)))
+    print('PROGRESS|PARSE|1|1', flush=True)
+    create_reports(session, texts, outgoing, incoming, healing, attacks, confirms,
+                   defensive_misses, corrections, suspicious, 0, len(texts))
+    shutil.copy2(session / 'damage_events.csv', session / 'fast_live_damage_events.csv')
+    report_path = session / 'COMBAT_REPORT.txt'
+    report_path.write_text(
+        'FAST RESULTS FROM LIVE OCR - NOT INDEPENDENT FFV1 POST ANALYSIS\n'
+        'Use Reanalyze (FFV1) in the GUI for the separate video-based result.\n\n'
+        + report_path.read_text(encoding='utf-8'), encoding='utf-8')
+    shutil.copy2(report_path, session / 'fast_live_COMBAT_REPORT.txt')
+    summary_path = session / 'analysis_summary.json'
+    summary = json.loads(summary_path.read_text(encoding='utf-8'))
+    summary['analysis_source'] = 'live_ocr_fast'
+    summary['data_quality']['numeric_validation'] = guard.stats
+    summary['data_quality']['wrapped_damage_rows'] = wrap_stats
+    summary['data_quality']['live_ocr_complete'] = log_metadata.get('capture_ocr_complete')
+    summary['data_quality']['live_ocr_dropped_crops'] = log_metadata.get('dropped_line_crops')
+    summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
+    shutil.copy2(summary_path, session / 'fast_live_analysis_summary.json')
+    reconcile(session, source='live_ocr_fast', wrap_stats=wrap_stats, guard_stats=guard.stats)
+    elapsed = time.perf_counter() - t0
+    write_post_analysis_timings(session, [('fast_live_ocr_read_parse_reports',elapsed)],elapsed,
+        {'fast_live_ocr_read_parse_reports':'FFV1 decode, visual reconstruction, and post Indra OCR skipped',
+         'TOTAL':'fast analysis from timestamped live OCR'})
+    print('PROGRESS|DONE|1|1', flush=True)
+    print('Fast analysis complete (source: live OCR, not FFV1 post).', flush=True)
+
+
+def prefer_live_main(wait_seconds=7.0):
+    session = locate_session()
+    if session is None:
+        raise SystemExit('No recorded session found.')
+    deadline = time.monotonic() + max(0.0, float(wait_seconds))
+    while True:
+        rows, meta = read_log(session)
+        if rows is not None:
+            _fast_live_analysis(session, rows, meta)
+            return
+        if time.monotonic() >= deadline:
+            print('Live OCR log not ready; automatically falling back to FFV1 post-analysis.',flush=True)
+            main()
+            return
+        time.sleep(.12)
+
+
 if __name__ == "__main__":
-    main()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--prefer-live', action='store_true',
+                        help='Use timestamped live OCR after Stop, with FFV1 fallback')
+    parser.add_argument('--full-post', action='store_true',
+                        help='Force independent FFV1 reconstruction and Indra OCR')
+    parser.add_argument('--live-wait', type=float, default=7.0)
+    args = parser.parse_args()
+    if args.prefer_live and not args.full_post:
+        prefer_live_main(args.live_wait)
+    else:
+        main()

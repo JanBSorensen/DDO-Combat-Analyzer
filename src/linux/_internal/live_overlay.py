@@ -30,8 +30,9 @@ CONFIG = HERE / "config.json"
 DEFAULT_LIVE_WINDOW_SECONDS = 15.0
 
 from cpu_utils import resolve_indra_threads
+from live_ocr_log import new_row, write_log
 
-if sys.platform.startswith('linux'):
+if sys.platform.startswith("linux"):
     from linux_x11 import (
         find_ddo_window as linux_find_ddo_window,
         is_ddo_foreground as linux_is_ddo_foreground,
@@ -353,31 +354,56 @@ def _shift_error(prev_feat, curr_feat, shift):
     return float(np.mean(np.abs(a.astype(np.int16) - b.astype(np.int16))))
 
 
-def estimate_shift_fast(prev_feat, curr_feat, line_height, max_shift_px):
-    # Require at least four text rows of overlap so very large shifts cannot win
-    # merely because only a tiny image strip remains to compare.
-    max_shift = min(max_shift_px, prev_feat.shape[0] - 4 * line_height)
-    max_shift = max(0, (max_shift // line_height) * line_height)
-    candidates = [(s, _shift_error(prev_feat, curr_feat, s))
-                  for s in range(0, max_shift + 1, line_height)]
+def estimate_shift_fast(prev_feat, curr_feat, line_height, max_shift_px, phase_offset=0):
+    """Find completed upward text-row scrolling, including sub-row phase shifts.
+
+    DDO often scrolls by one or more rows PLUS a few pixels.  The preceding
+    grid phase then differs from the current phase.  Restricting candidate
+    displacements to 0, line_height, 2*line_height, ... leaves a sticky visual
+    anchor stranded forever at the first such scroll.  Search the phase-
+    corrected displacements as well, without treating an unfinished (< one
+    complete line) animated movement as a new OCR row.
+    """
+    line_height = max(1, int(line_height))
+    phase_offset = int(phase_offset) % line_height
+    max_shift = min(int(max_shift_px), prev_feat.shape[0] - 4 * line_height)
+    max_shift = max(0, max_shift)
+
+    # Always compare the no-scroll reference, and explicitly TEST the
+    # incomplete sub-row displacement.  Without the partial candidate,
+    # scrolling by only 4px can resemble scrolling by 18px because adjacent
+    # combat lines share much of their text.  Never rebase on a partial row.
+    shifts = [0]
+    if 0 < phase_offset < line_height:
+        shifts.append(phase_offset)
+    shifts.extend(s for s in range(line_height, max_shift + 1)
+                  if s % line_height == phase_offset)
+    candidates = [(s, _shift_error(prev_feat, curr_feat, s)) for s in shifts]
     zero_error = candidates[0][1]
     best_shift, best_error = min(candidates, key=lambda x: x[1])
 
     if best_shift == 0:
         return 0, best_error, zero_error, "zero"
+    if best_shift < line_height:
+        return 0, best_error, zero_error, "partial-scroll->hold"
+    if phase_offset:
+        partial_error = candidates[1][1]
+        if partial_error <= best_error + max(0.25, best_error * 0.12):
+            return 0, best_error, zero_error, "ambiguous-partial->hold"
 
-    # A genuine scroll normally produces a dramatic error reduction. This
-    # relative test is intentionally conservative to avoid duplicate OCR lines.
+    # Require overwhelming alignment improvement.  This avoids inventing
+    # scrolls when new text was merely appended to a non-scrolling log.
     ratio = best_error / max(zero_error, 1e-6)
     if ratio > 0.62:
         return 0, best_error, zero_error, "uncertain->zero"
 
-    # If several shifts are nearly identical, prefer the smallest positive one.
     tolerance = max(0.25, best_error * 0.12)
     close = [(s, e) for s, e in candidates if s > 0 and e <= best_error + tolerance]
     if close:
         best_shift, best_error = min(close, key=lambda x: x[0])
-    return best_shift, best_error, zero_error, "positive"
+    return best_shift, best_error, zero_error, (
+        "phase-corrected-positive" if phase_offset else "positive"
+    )
 
 
 # Robust post-analysis alignment, used only as a second opinion when the cheap
@@ -506,6 +532,82 @@ def estimate_shift_robust_live(prev_gray, curr_gray, line_height, max_shift_px, 
     )
     return shift, chosen_score, zero, decision, confident, margin, second_score
 
+
+
+def circular_phase_distance(a, b, line_height):
+    """Smallest distance between two row-grid phases on a circular line-height scale."""
+    if a is None or b is None:
+        return int(line_height)
+    lh = max(1, int(line_height))
+    da = (int(a) - int(b)) % lh
+    db = (int(b) - int(a)) % lh
+    return int(min(da, db))
+
+
+def line_match_feature_live(crop):
+    """Feature used by the conservative live line-by-line fallback."""
+    blur = cv2.GaussianBlur(crop, (0, 0), 1.4)
+    high = cv2.absdiff(crop, blur)
+    if high.shape[1] > 40:
+        high = high[:, 15:-15]
+    _, high = cv2.threshold(high, 10, 255, cv2.THRESH_TOZERO)
+    return high.astype(np.float32) / 255.0
+
+
+def cosine_live(a, b):
+    if a.shape != b.shape or a.size == 0:
+        return 0.0
+    af = a.reshape(-1)
+    bf = b.reshape(-1)
+    denom = float(np.linalg.norm(af) * np.linalg.norm(bf))
+    if denom < 1e-9:
+        return 0.0
+    return float(np.dot(af, bf) / denom)
+
+
+def estimate_shift_linewise_live(prev_gray, curr_gray, prev_phase, curr_phase, line_height, max_shift_px):
+    """Conservative line-by-line fallback for an ambiguous completed scroll.
+
+    This is intentionally used only when the sticky alignment anchor has changed
+    visually but the fast whole-frame matcher still reports zero.  It is not on
+    the normal 30-fps path.
+    """
+    prev_cells = line_cells(prev_gray, prev_phase, line_height)
+    curr_cells = line_cells(curr_gray, curr_phase, line_height)
+    if len(prev_cells) < 6 or len(curr_cells) < 6:
+        return 0, 0.0, 0.0, False
+
+    prev_feats = [line_match_feature_live(prev_gray[y0:y1]) for y0, y1 in prev_cells]
+    curr_feats = [line_match_feature_live(curr_gray[y0:y1]) for y0, y1 in curr_cells]
+
+    max_lines = min(int(max_shift_px // line_height), len(prev_feats) - 4)
+    candidates = []
+    for shift_lines in range(max_lines + 1):
+        overlap = min(len(prev_feats) - shift_lines, len(curr_feats))
+        if overlap < 4:
+            continue
+        sims = [
+            cosine_live(prev_feats[j + shift_lines], curr_feats[j])
+            for j in range(overlap)
+        ]
+        score = float(np.mean(sims)) if sims else 0.0
+        strong = sum(1 for x in sims if x >= 0.94)
+        candidates.append((score, strong, overlap, shift_lines))
+
+    if not candidates:
+        return 0, 0.0, 0.0, False
+
+    candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+    best = candidates[0]
+    second_score = candidates[1][0] if len(candidates) > 1 else 0.0
+    best_score, strong, overlap, shift_lines = best
+    required_strong = max(4, int(round(overlap * 0.55)))
+    confident = bool(
+        best_score >= 0.94
+        and strong >= required_strong
+        and (best_score - second_score) >= 0.015
+    )
+    return shift_lines * line_height, best_score, second_score, confident
 
 def line_cells(gray, phase, line_height):
     h = gray.shape[0]
@@ -674,6 +776,9 @@ def make_clickthrough(root):
         WS_EX_NOACTIVATE = 0x08000000
         user32 = ctypes.windll.user32
         style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        # Do not force WS_EX_LAYERED here. Tk manages layered composition itself
+        # for transparent-color/alpha windows; forcing it after widget creation
+        # can leave a visible rectangle while child/text drawing disappears.
         style |= WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
         user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
     except Exception:
@@ -729,10 +834,15 @@ class LiveEstimator:
         self.live_event_path = self.session / "live_damage_events.csv"
         self.live_event_records = []
         self.live_event_records_lock = threading.Lock()
+        self.live_ocr_records_lock = threading.Lock()
+        self.live_ocr_records = []
+        self.ocr_batch_inflight = ()
         self.live_raw_damage_total = 0
         self.live_corrected_damage_total = 0
         self.scan_path = Path(os.devnull)
-        self.track_path = Path(os.devnull)
+        # Test build: persist lightweight 30-fps tracking diagnostics so live
+        # reconstruction can be compared directly with post-analysis.
+        self.track_path = self.session / "live_tracking.csv"
         self.status_path = None
         self.overlay_error_path = self.session / "live_overlay_error.txt"
 
@@ -763,6 +873,15 @@ class LiveEstimator:
         self.tracking_frames = 0
         self.tracking_late_frames = 0
         self.tracking_max_lateness_ms = 0.0
+        # A sticky visual anchor prevents smooth sub-line DDO scroll animation
+        # from being lost when consecutive 30-fps frames move only a few pixels.
+        self.anchor_zero_rebase_error = float(self.live_cfg.get("anchor_zero_rebase_error", 0.75))
+        self.anchor_timeout_frames = max(30, int(self.live_cfg.get("anchor_timeout_frames", self.tracking_fps * 2)))
+        self.anchor_hold_frames_total = 0
+        self.anchor_linewise_runs = 0
+        self.anchor_linewise_overrides = 0
+        self.phase_corrected_scrolls = 0
+        self.anchor_phase_timeout_rebases = 0
 
         self.root = None
         self.overlay_canvas = None
@@ -859,7 +978,7 @@ class LiveEstimator:
             if pending is None:
                 return False
             elapsed = float(pending["elapsed"])
-            if max_elapsed is not None and elapsed > float(max_elapsed) + 0.05:
+            if max_elapsed is not None and elapsed > float(max_elapsed) + 1e-6:
                 return False
             crop = pending.get("partial_crop")
             self.pending_bottom_line = None
@@ -958,6 +1077,22 @@ class LiveEstimator:
                 row[1] = f"{row[1]:.6f}"
                 row[2] = f"{row[2]:.6f}"
                 w.writerow(row)
+
+    def record_live_ocr_line(self, elapsed, raw, effective, amount,
+                             numeric_recheck, numeric_recheck_amount, event_elapsed):
+        """Save every Indra OCR output row (including non-damage and empty rows)."""
+        row = new_row(elapsed, self.start_epoch, raw, effective, amount,
+                      numeric_recheck, numeric_recheck_amount, event_elapsed)
+        with self.live_ocr_records_lock:
+            self.live_ocr_records.append(row)
+
+    def write_live_ocr_log(self):
+        with self.live_ocr_records_lock:
+            rows = list(self.live_ocr_records)
+        write_log(self.session, rows, complete=True,
+                  dropped=self.dropped_lines_total,
+                  started_epoch=self.start_epoch,
+                  note='All OCR outputs from captured line crops; dropped crops are counted separately.')
 
     def init_live_ocr_engine(self):
         """Load the persistent Indra OCR model used by live DPS."""
@@ -1069,6 +1204,7 @@ class LiveEstimator:
                     except queue.Empty:
                         break
 
+                self.ocr_batch_inflight = tuple(float(x[0]) for x in items)
                 t0 = time.perf_counter()
                 try:
                     texts = self.ocr_indra_batch(items)
@@ -1081,6 +1217,7 @@ class LiveEstimator:
                                 completion_event.set()
                         finally:
                             self.ocr_queue.task_done()
+                    self.ocr_batch_inflight = ()
                     self.stop_event.set()
                     break
 
@@ -1094,7 +1231,8 @@ class LiveEstimator:
                     accepted_for_live = float(elapsed) + 1e-6 >= live_accept_after
                     if accepted_for_live:
                         self.ocr_lines_total += 1
-                    text = normalize_text(text) if text else ""
+                    raw_ocr_text = normalize_text(text) if text else ""
+                    text = raw_ocr_text
                     # Full-height rows are never repaired here.  A crop shorter
                     # than the locked line height can only be the Stop/EOF
                     # fallback for a pending bottom fragment.  On the validated
@@ -1231,6 +1369,10 @@ class LiveEstimator:
                             self.attacks.append(elapsed)
                         self.parsed_attacks_total += 1
 
+                    self.record_live_ocr_line(
+                        elapsed, raw_ocr_text, text, amount,
+                        numeric_recheck, numeric_recheck_amount, event_elapsed
+                    )
                     scan_w.writerow([
                         f"{elapsed:.6f}",
                         f"{per_line_ms:.1f}",
@@ -1247,6 +1389,7 @@ class LiveEstimator:
                     self.ocr_queue.task_done()
                     if completion_event is not None:
                         completion_event.set()
+                self.ocr_batch_inflight = ()
                 scan_f.flush()
 
                 if self.ocr_lines_total == len(items) or self.ocr_lines_total % 10 < len(items):
@@ -1271,6 +1414,10 @@ class LiveEstimator:
             self.write_live_damage_events()
         except Exception as exc:
             self.update_queue.put(("error", f"Could not write live_damage_events.csv: {exc}"))
+        try:
+            self.write_live_ocr_log()
+        except Exception as exc:
+            self.update_queue.put(("error", f"Could not write live_ocr_lines.csv: {exc}"))
 
         self.write_status(ocr_worker_finished=True, ocr_queue_depth=self.ocr_queue.qsize())
 
@@ -1331,6 +1478,10 @@ class LiveEstimator:
                 "zero_score",
                 "decision",
                 "grid_phase",
+                "anchor_phase",
+                "phase_delta",
+                "anchor_age_frames",
+                "anchor_action",
                 "linewise_shift_px",
                 "linewise_score",
                 "linewise_second_score",
@@ -1348,6 +1499,13 @@ class LiveEstimator:
             prev_feat = None
             prev_phase = None
             last_phase = None
+            # Immediate previous frame is kept for append-only detection.
+            # Alignment uses a separate sticky anchor that is NOT advanced by
+            # partial-line scroll animation.
+            align_gray = None
+            align_feat = None
+            align_phase = None
+            align_age_frames = 0
 
             baseline_path = self.session / "baseline_gray.png"
             if baseline_path.exists():
@@ -1361,11 +1519,19 @@ class LiveEstimator:
                         prev_feat = fast_text_feature(bgray)
                         prev_phase = best_grid_phase_from_feature(prev_feat, self.line_height)
                         last_phase = prev_phase
+                        align_gray = bgray
+                        align_feat = prev_feat
+                        align_phase = prev_phase
+                        align_age_frames = 0
                 except Exception:
                     prev_gray = None
                     prev_feat = None
                     prev_phase = None
                     last_phase = None
+                    align_gray = None
+                    align_feat = None
+                    align_phase = None
+                    align_age_frames = 0
 
             next_deadline = time.perf_counter()
             next_live_sample = next_deadline
@@ -1412,6 +1578,10 @@ class LiveEstimator:
                         prev_feat = None
                         prev_phase = None
                         last_phase = None
+                        align_gray = None
+                        align_feat = None
+                        align_phase = None
+                        align_age_frames = 0
                         self.clear_pending_bottom_line(count_drop=True)
 
                         now2 = time.perf_counter()
@@ -1441,6 +1611,10 @@ class LiveEstimator:
                         prev_feat = None
                         prev_phase = None
                         last_phase = None
+                        align_gray = None
+                        align_feat = None
+                        align_phase = None
+                        align_age_frames = 0
                         self.write_status(capture_paused_no_ddo_focus=False)
 
                     shot = sct.grab(region)
@@ -1469,6 +1643,10 @@ class LiveEstimator:
                                     prev_feat = None
                                     prev_phase = None
                                     last_phase = None
+                                    align_gray = None
+                                    align_feat = None
+                                    align_phase = None
+                                    align_age_frames = 0
                                     self.clear_pending_bottom_line(count_drop=True)
                                 self.line_height_locked = True
 
@@ -1490,30 +1668,43 @@ class LiveEstimator:
                     robust_second = 0.0
                     robust_confident = False
                     robust_override = False
-                    if prev_gray is None:
+                    lw_shift = 0
+                    lw_score = 0.0
+                    lw_second = 0.0
+                    lw_confident = False
+                    anchor_action = ""
+                    phase_delta = 0
+
+                    if align_gray is None:
                         shift = 0
                         score = 1.0
                         zero = 1.0
                         decision = "baseline"
-                        lw_shift = 0
-                        lw_score = 1.0
-                        lw_second = 0.0
                         crops = []
+                        align_gray = gray
+                        align_feat = feat
+                        align_phase = phase
+                        align_age_frames = 0
+                        anchor_action = "baseline"
                     else:
+                        phase_delta = circular_phase_distance(
+                            phase, align_phase, self.line_height
+                        )
                         shift, score, zero, decision = estimate_shift_fast(
-                            prev_feat,
+                            align_feat,
                             feat,
                             self.line_height,
                             self.max_shift_px,
+                            phase_offset=(align_phase - phase) % self.line_height,
                         )
-                        lw_shift = 0
-                        lw_score = 0.0
-                        lw_second = 0.0
+                        if decision == "phase-corrected-positive" and shift > 0:
+                            self.phase_corrected_scrolls += 1
 
-                        # Second opinion only for ambiguous live frames.  Keep
-                        # the cheap matcher on the 30-fps fast path, and let the
-                        # robust post-analysis matcher override only when it is
-                        # itself confidently positive.
+                        # FastAlignment remains the first fallback for ambiguous
+                        # anchor comparisons.  The anchor may span several 30-fps
+                        # frames while DDO animates one text row a few pixels at a
+                        # time, so it compares against align_gray rather than the
+                        # immediately previous frame.
                         if decision == "uncertain->zero":
                             self.robust_fallback_runs += 1
                             (
@@ -1521,7 +1712,7 @@ class LiveEstimator:
                                 robust_decision, robust_confident,
                                 _robust_margin, robust_second,
                             ) = estimate_shift_robust_live(
-                                prev_gray,
+                                align_gray,
                                 gray,
                                 self.line_height,
                                 self.max_shift_px,
@@ -1534,6 +1725,34 @@ class LiveEstimator:
                                 self.robust_fallback_overrides += 1
                             else:
                                 decision += "+robust-keep-zero"
+
+                        # If the visual anchor changed substantially but the
+                        # whole-frame matcher still says zero, verify completed
+                        # whole-row scrolling line-by-line.  This is deliberately
+                        # restricted to near-matching grid phases so it does not
+                        # run on every intermediate animation frame.
+                        if (
+                            shift == 0
+                            and phase_delta <= 1
+                            and zero > self.anchor_zero_rebase_error
+                        ):
+                            self.anchor_linewise_runs += 1
+                            (
+                                lw_shift, lw_score, lw_second, lw_confident
+                            ) = estimate_shift_linewise_live(
+                                align_gray,
+                                gray,
+                                align_phase,
+                                phase,
+                                self.line_height,
+                                self.max_shift_px,
+                            )
+                            if lw_confident and lw_shift > 0:
+                                shift = int(lw_shift)
+                                decision += "+linewise-positive"
+                                self.anchor_linewise_overrides += 1
+                            elif lw_confident:
+                                decision += "+linewise-zero"
 
                         crop_entries = []  # (elapsed, crop)
                         recovered = self.recover_pending_bottom_line(gray, feat, shift)
@@ -1549,7 +1768,14 @@ class LiveEstimator:
                             if self.defer_pending_bottom_line(gray, deferred_y0, elapsed):
                                 decision += "+defer-bottom"
 
-                        if not crop_entries and shift == 0 and prev_phase == phase:
+                        # Append-only detection still compares consecutive frames;
+                        # it is independent of the sticky scroll anchor.
+                        if (
+                            not crop_entries
+                            and shift == 0
+                            and prev_feat is not None
+                            and prev_phase == phase
+                        ):
                             append_crops = crop_blank_to_filled_lines(
                                 prev_feat, gray, feat, phase, self.line_height
                             )
@@ -1561,6 +1787,63 @@ class LiveEstimator:
                             self.enqueue_new_lines([crop], crop_elapsed)
                         crops = [crop for _crop_elapsed, crop in crop_entries]
 
+                        # IMPORTANT: do not automatically make every 30-fps frame
+                        # the next alignment reference.  During DDO's smooth chat
+                        # scroll, consecutive frames can move only 2-6 pixels. The
+                        # old code rebased on those zero-shift frames and therefore
+                        # never accumulated a full line_height movement.  Hold the
+                        # anchor until a complete row is visible, an append-only
+                        # change is confirmed, or the frame is essentially static.
+                        if shift > 0:
+                            align_gray = gray
+                            align_feat = feat
+                            align_phase = phase
+                            align_age_frames = 0
+                            anchor_action = "scroll-rebase"
+                        elif "+append" in decision:
+                            align_gray = gray
+                            align_feat = feat
+                            align_phase = phase
+                            align_age_frames = 0
+                            anchor_action = "append-rebase"
+                        elif lw_confident and lw_shift == 0:
+                            align_gray = gray
+                            align_feat = feat
+                            align_phase = phase
+                            align_age_frames = 0
+                            anchor_action = "linewise-zero-rebase"
+                        elif phase_delta == 0 and zero <= self.anchor_zero_rebase_error:
+                            align_gray = gray
+                            align_feat = feat
+                            align_phase = phase
+                            align_age_frames = 0
+                            anchor_action = "static-rebase"
+                        else:
+                            align_age_frames += 1
+                            self.anchor_hold_frames_total += 1
+                            anchor_action = "hold"
+                            decision += "+anchor-hold"
+                            # Safety valve only after a long unresolved period and
+                            # only when the row grid has returned to the anchor
+                            # phase. This avoids a permanently stale reference but
+                            # never rebases in the middle of visible sub-line motion.
+                            if (
+                                align_age_frames >= self.anchor_timeout_frames
+                            ):
+                                # Last-resort recovery: never hold an obsolete
+                                # anchor indefinitely after a changed grid phase.
+                                # If we cannot match its scroll after two seconds,
+                                # rebase so subsequent text can be recovered.
+                                if phase_delta > 1:
+                                    self.anchor_phase_timeout_rebases += 1
+                                    decision += "+phase-timeout"
+                                align_gray = gray
+                                align_feat = feat
+                                align_phase = phase
+                                align_age_frames = 0
+                                anchor_action = "timeout-rebase"
+                                decision += "+anchor-timeout-rebase"
+
                     track_w.writerow([
                         self.tracking_frames,
                         f"{elapsed:.6f}",
@@ -1570,6 +1853,10 @@ class LiveEstimator:
                         f"{zero:.5f}",
                         decision,
                         phase,
+                        "" if align_phase is None else align_phase,
+                        phase_delta,
+                        align_age_frames,
+                        anchor_action,
                         lw_shift,
                         f"{lw_score:.5f}",
                         f"{lw_second:.5f}",
@@ -1637,6 +1924,8 @@ class LiveEstimator:
                             bottom_dropped_total=self.bottom_dropped_total,
                             robust_fallback_runs=self.robust_fallback_runs,
                             robust_fallback_overrides=self.robust_fallback_overrides,
+                            phase_corrected_scrolls=self.phase_corrected_scrolls,
+                            anchor_phase_timeout_rebases=self.anchor_phase_timeout_rebases,
                         )
                         next_status = now2 + 1.0
 
@@ -1822,7 +2111,7 @@ def watch_parent_process(estimator, parent_pid):
     """Set the helper stop event when its creating GUI exits."""
     if not parent_pid:
         return
-    if sys.platform.startswith("linux"):
+    if sys.platform.startswith('linux'):
         while not estimator.stop_event.is_set() and parent_is_alive(parent_pid):
             time.sleep(0.5)
         estimator.stop_event.set()

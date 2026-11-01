@@ -19,7 +19,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
 
-if sys.platform.startswith('linux'):
+if sys.platform.startswith("linux"):
     from linux_x11 import find_ddo_window as linux_find_ddo_window, is_ddo_foreground as linux_is_ddo_foreground
 
 
@@ -268,6 +268,11 @@ def main():
     focus_pause_total = 0.0
     pending_resume_index = None
     force_next_anchor = False
+    # Hold the final capture-index row until we know whether Stop occurred.
+    # This lets us append the LAST image actually captured (without taking a
+    # post-Stop screenshot) as a lossless terminal FFV1 anchor.
+    pending_index_row = None
+    pending_last_gray = None
 
     with index_path.open("w", newline="", encoding="utf-8") as cf:
         writer = csv.writer(cf)
@@ -366,7 +371,13 @@ def main():
                         late_frames += 1
                     max_lateness = max(max_lateness, lateness)
 
-                    writer.writerow([
+                    # Keep one pending row so Stop can promote the final
+                    # UNSAVED capture to a terminal anchor without rewriting
+                    # the index, creating a duplicate capture or grabbing a
+                    # new image after Stop.
+                    if pending_index_row is not None:
+                        writer.writerow(pending_index_row)
+                    pending_index_row = [
                         captured,
                         datetime.now().isoformat(timespec="milliseconds"),
                         f"{elapsed:.6f}",
@@ -375,7 +386,8 @@ def main():
                         f"{change_ratio:.7f}",
                         int(is_forced and should_save),
                         f"{lateness * 1000:.3f}",
-                    ])
+                    ]
+                    pending_last_gray = None if should_save else gray
 
                     if captured % 30 == 0:
                         cf.flush()
@@ -410,6 +422,22 @@ def main():
             print()
             print("Ctrl+C received.")
         finally:
+            if pending_index_row is not None:
+                # The final frame is already timestamped and captured before
+                # Stop.  Guarantee that independent FFV1 analysis can see it
+                # even if the next 0.5-second forced anchor never arrived.
+                if (stop_event.is_set() and pending_last_gray is not None
+                        and focus_pause_started is None and is_ddo_foreground()
+                        and proc.poll() is None):
+                    proc.stdin.write(pending_last_gray.tobytes())
+                    saved += 1
+                    skipped -= 1
+                    forced += 1
+                    pending_index_row[3] = 1
+                    pending_index_row[4] = saved
+                    pending_index_row[6] = 1
+                    print(f"FINAL_ANCHOR_SAVED|{pending_index_row[2]}", flush=True)
+                writer.writerow(pending_index_row)
             cf.flush()
 
     capture_elapsed = max(0.001, time.perf_counter() - start)

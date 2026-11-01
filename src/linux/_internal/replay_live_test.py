@@ -14,10 +14,12 @@ import cv2
 from live_overlay import (
     LiveEstimator,
     best_grid_phase_from_feature,
+    circular_phase_distance,
     crop_blank_to_filled_lines,
     crop_new_lines,
     detect_line_height_from_gray,
     estimate_shift_fast,
+    estimate_shift_linewise_live,
     estimate_shift_robust_live,
     fast_text_feature,
 )
@@ -222,12 +224,20 @@ def run_replay(session: Path):
     prev_gray = None
     prev_feat = None
     prev_phase = None
+    align_gray = None
+    align_feat = None
+    align_phase = None
+    align_age_frames = 0
     baseline = session / "baseline_gray.png"
     if baseline.exists():
         prev_gray = cv2.imread(str(baseline), cv2.IMREAD_GRAYSCALE)
         if prev_gray is not None:
             prev_feat = fast_text_feature(prev_gray)
             prev_phase = best_grid_phase_from_feature(prev_feat, est.line_height)
+            align_gray = prev_gray
+            align_feat = prev_feat
+            align_phase = prev_phase
+            align_age_frames = 0
 
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
@@ -248,6 +258,14 @@ def run_replay(session: Path):
         "zero_score",
         "decision",
         "grid_phase",
+        "anchor_phase",
+        "phase_delta",
+        "anchor_age_frames",
+        "anchor_action",
+        "linewise_shift_px",
+        "linewise_score",
+        "linewise_second_score",
+        "linewise_confident",
         "robust_shift_px",
         "robust_score",
         "robust_second_score",
@@ -277,6 +295,10 @@ def run_replay(session: Path):
                 prev_gray = None
                 prev_feat = None
                 prev_phase = None
+                align_gray = None
+                align_feat = None
+                align_phase = None
+                align_age_frames = 0
                 est.clear_pending_bottom_line(count_drop=True)
 
             feat = fast_text_feature(gray)
@@ -298,6 +320,10 @@ def run_replay(session: Path):
                             prev_gray = None
                             prev_feat = None
                             prev_phase = None
+                            align_gray = None
+                            align_feat = None
+                            align_phase = None
+                            align_age_frames = 0
                             est.clear_pending_bottom_line(count_drop=True)
                         est.line_height_locked = True
 
@@ -307,17 +333,32 @@ def run_replay(session: Path):
             robust_second = 0.0
             robust_confident = False
             robust_override = False
+            lw_shift = 0
+            lw_score = 0.0
+            lw_second = 0.0
+            lw_confident = False
+            phase_delta = 0
+            anchor_action = ""
             crops = []
 
-            if prev_gray is None:
+            if align_gray is None:
                 shift = 0
                 score = 1.0
                 zero = 1.0
                 decision = "baseline"
+                align_gray = gray
+                align_feat = feat
+                align_phase = phase
+                align_age_frames = 0
+                anchor_action = "baseline"
             else:
+                phase_delta = circular_phase_distance(phase, align_phase, est.line_height)
                 shift, score, zero, decision = estimate_shift_fast(
-                    prev_feat, feat, est.line_height, est.max_shift_px
+                    align_feat, feat, est.line_height, est.max_shift_px,
+                    phase_offset=(align_phase - phase) % est.line_height,
                 )
+                if decision == "phase-corrected-positive" and shift > 0:
+                    est.phase_corrected_scrolls += 1
                 if decision == "uncertain->zero":
                     est.robust_fallback_runs += 1
                     (
@@ -329,7 +370,7 @@ def run_replay(session: Path):
                         _robust_margin,
                         robust_second,
                     ) = estimate_shift_robust_live(
-                        prev_gray,
+                        align_gray,
                         gray,
                         est.line_height,
                         est.max_shift_px,
@@ -342,6 +383,27 @@ def run_replay(session: Path):
                         est.robust_fallback_overrides += 1
                     else:
                         decision += "+robust-keep-zero"
+
+                if (
+                    shift == 0
+                    and phase_delta <= 1
+                    and zero > est.anchor_zero_rebase_error
+                ):
+                    est.anchor_linewise_runs += 1
+                    lw_shift, lw_score, lw_second, lw_confident = estimate_shift_linewise_live(
+                        align_gray,
+                        gray,
+                        align_phase,
+                        phase,
+                        est.line_height,
+                        est.max_shift_px,
+                    )
+                    if lw_confident and lw_shift > 0:
+                        shift = int(lw_shift)
+                        decision += "+linewise-positive"
+                        est.anchor_linewise_overrides += 1
+                    elif lw_confident:
+                        decision += "+linewise-zero"
 
                 crop_entries = []
                 recovered = est.recover_pending_bottom_line(gray, feat, shift)
@@ -357,7 +419,12 @@ def run_replay(session: Path):
                     if est.defer_pending_bottom_line(gray, deferred_y0, elapsed):
                         decision += "+defer-bottom"
 
-                if not crop_entries and shift == 0 and prev_phase == phase:
+                if (
+                    not crop_entries
+                    and shift == 0
+                    and prev_feat is not None
+                    and prev_phase == phase
+                ):
                     append_crops = crop_blank_to_filled_lines(
                         prev_feat, gray, feat, phase, est.line_height
                     )
@@ -369,6 +436,46 @@ def run_replay(session: Path):
                     est.enqueue_new_lines([crop], crop_elapsed)
                 crops = [crop for _crop_elapsed, crop in crop_entries]
 
+                if shift > 0:
+                    align_gray = gray
+                    align_feat = feat
+                    align_phase = phase
+                    align_age_frames = 0
+                    anchor_action = "scroll-rebase"
+                elif "+append" in decision:
+                    align_gray = gray
+                    align_feat = feat
+                    align_phase = phase
+                    align_age_frames = 0
+                    anchor_action = "append-rebase"
+                elif lw_confident and lw_shift == 0:
+                    align_gray = gray
+                    align_feat = feat
+                    align_phase = phase
+                    align_age_frames = 0
+                    anchor_action = "linewise-zero-rebase"
+                elif phase_delta == 0 and zero <= est.anchor_zero_rebase_error:
+                    align_gray = gray
+                    align_feat = feat
+                    align_phase = phase
+                    align_age_frames = 0
+                    anchor_action = "static-rebase"
+                else:
+                    align_age_frames += 1
+                    est.anchor_hold_frames_total += 1
+                    anchor_action = "hold"
+                    decision += "+anchor-hold"
+                    if align_age_frames >= est.anchor_timeout_frames:
+                        if phase_delta > 1:
+                            est.anchor_phase_timeout_rebases += 1
+                            decision += "+phase-timeout"
+                        align_gray = gray
+                        align_feat = feat
+                        align_phase = phase
+                        align_age_frames = 0
+                        anchor_action = "timeout-rebase"
+                        decision += "+anchor-timeout-rebase"
+
             track_w.writerow([
                 saved_frame,
                 entry["capture_frame"],
@@ -379,6 +486,14 @@ def run_replay(session: Path):
                 f"{zero:.6f}",
                 decision,
                 phase,
+                "" if align_phase is None else align_phase,
+                phase_delta,
+                align_age_frames,
+                anchor_action,
+                lw_shift,
+                f"{lw_score:.6f}",
+                f"{lw_second:.6f}",
+                lw_confident,
                 robust_shift,
                 f"{robust_score:.6f}",
                 f"{robust_second:.6f}",
@@ -456,6 +571,9 @@ def run_replay(session: Path):
         "bottom_dropped": int(est.bottom_dropped_total),
         "robust_fallback_runs": int(est.robust_fallback_runs),
         "robust_fallback_overrides": int(est.robust_fallback_overrides),
+        "anchor_hold_frames": int(est.anchor_hold_frames_total),
+        "anchor_linewise_runs": int(est.anchor_linewise_runs),
+        "anchor_linewise_overrides": int(est.anchor_linewise_overrides),
         "line_height_used": int(est.line_height),
         "indra_threads": int(est.indra_threads),
         "ocr_batch_max_lines": int(est.ocr_batch_max),

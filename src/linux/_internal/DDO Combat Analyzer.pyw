@@ -91,8 +91,8 @@ def dependency_status():
         "NumPy": "numpy",
         "Indra OCR": "indra_ocr",
     }
-    if sys.platform.startswith("linux"):
-        modules["python-xlib"] = "Xlib"
+    if sys.platform.startswith('linux'):
+        modules['python-xlib'] = 'Xlib'
     missing = [label for label, module in modules.items() if importlib.util.find_spec(module) is None]
     return {
         "missing_python": missing,
@@ -595,9 +595,8 @@ class LowLevelHotkeyManager:
         self._suppress_until_up = False
 
 
-if sys.platform.startswith("linux"):
+if sys.platform.startswith('linux'):
     LowLevelHotkeyManager = LinuxHotkeyManager
-
 
 # ----------------------------- application --------------------------------
 
@@ -779,7 +778,7 @@ class App(tk.Tk):
         self.open_folder_btn.pack(side="left", padx=(8, 0))
 
         self.reprocess_btn = ttk.Button(
-            row3, text="Reanalyze selected", command=self.reprocess_selected, state="disabled"
+            row3, text="Reanalyze (FFV1)", command=self.reprocess_selected, state="disabled"
         )
         self.reprocess_btn.pack(side="left", padx=(8, 0))
 
@@ -2295,10 +2294,12 @@ class App(tk.Tk):
             return
         self.set_status("Installing ...", "#c98b16")
         self.set_busy(True, "Installing Python packages ...")
-        packages = ["mss", "opencv-python", "numpy", "indra-ocr"]
+        cmd = [
+            sys.executable, "-m", "pip", "install",
+            "mss", "opencv-python", "numpy", "indra-ocr"
+        ]
         if sys.platform.startswith("linux"):
-            packages.append("python-xlib")
-        cmd = [sys.executable, "-m", "pip", "install", *packages]
+            cmd.append("python-xlib")
         self.start_subprocess(cmd, "install", stdin_pipe=False)
 
     # -------------------------- continuous live / hotkey ---------------------
@@ -2344,7 +2345,7 @@ class App(tk.Tk):
                             time.sleep(0.08)
                 except Exception:
                     pass
-            elif sys.platform.startswith("linux"):
+            elif sys.platform.startswith('linux'):
                 try:
                     linux_beep(repeat=repeat)
                 except Exception:
@@ -2838,8 +2839,8 @@ class App(tk.Tk):
                 self.stop_live_estimator()
             if code == 0:
                 self.set_status("Analyzing ...", "#c98b16")
-                self.set_busy(True, "Reconstructing combat log ...")
-                self.start_analysis()
+                self.set_busy(True, "Analyzing recorded live OCR (FFV1 fallback enabled) ...")
+                self.start_analysis(prefer_live=True)
             else:
                 if not self.analysis_background:
                     self.deiconify()
@@ -2864,6 +2865,19 @@ class App(tk.Tk):
                 self.set_status("Complete", "#2e8b57")
                 self.current_session = latest_session()
                 self.load_results(self.current_session)
+                try:
+                    _analysis_info = json.loads((self.current_session / 'analysis_summary.json').read_text(encoding='utf-8'))
+                    _source = _analysis_info.get('analysis_source', '')
+                    if _source == 'live_ocr_fast':
+                        self.set_status('Fast analysis (live OCR)', '#2e8b57')
+                        self.overview_note.config(text=(
+                            'Instant results from timestamped live OCR. Reanalyze (FFV1) '
+                            'for an independent post-analysis and detailed live/post comparison.'
+                        ))
+                    elif _source == 'ffv1_post':
+                        self.set_status('Independent FFV1 analysis complete', '#2e8b57')
+                except Exception:
+                    pass
                 if not background:
                     self.notebook.select(self.overview_tab)
                 result_dps = self.session_dps(self.current_session)
@@ -3287,11 +3301,15 @@ class App(tk.Tk):
         # Stay in the analyzer while the recording is finalized.
         # There is no reason to switch back to DDO after the user has pressed Stop.
 
-    def start_analysis(self):
+    def start_analysis(self, prefer_live=False):
         self.progress.stop()
         self.progress.config(mode="determinate", maximum=100, value=0)
-        self.progress_text.config(text="Step 1/4 - Preparing analysis...")
-        cmd = [sys.executable, str(HERE / "process_latest.py")]
+        self.progress_text.config(text=(
+            "Reading timestamped live OCR - fast analysis ..." if prefer_live else
+            "Step 1/4 - Independent FFV1 post-analysis ..."
+        ))
+        cmd = [sys.executable, str(HERE / "process_latest.py"),
+               "--prefer-live" if prefer_live else "--full-post"]
         self.start_subprocess(cmd, "analyze", stdin_pipe=False)
 
     def reprocess_selected(self, session=None):
@@ -3847,6 +3865,38 @@ class App(tk.Tk):
             "",
             "OCR engine: Indra",
         ]
+        try:
+            compare = json.loads((session / 'live_post_diagnostics.json').read_text(encoding='utf-8'))
+            source = analysis_summary.get('analysis_source', 'older build / unspecified')
+            diagnostics.extend([
+                '', 'ANALYSIS SOURCE',
+                'Fast live OCR' if source == 'live_ocr_fast' else
+                ('FFV1 independent post' if source == 'ffv1_post' else source),
+                f"Live OCR logged rows:  {compare.get('live_ocr_lines', '—')}",
+                f"Live OCR complete:     {compare.get('live_ocr_complete', '—')}",
+                f"Dropped live crops:    {compare.get('live_dropped_crops', '—')}",
+                f"Peak OCR queue:        {compare.get('max_live_ocr_queue_depth', '—')}",
+                f"Wrapped incoming:      {compare.get('wrapped_lines', {}).get('incoming_wraps', '—')}",
+                f"Numeric rejected:      {compare.get('numeric_validation', {}).get('rejected', '—')}",
+            ])
+            if compare.get('post_ffv1_available'):
+                diagnostics.extend([
+                    '', 'LIVE / INDEPENDENT POST RECONCILIATION',
+                    f"Live damage:          {dknum(compare.get('live_total_damage', 0))}",
+                    f"FFV1 damage:          {dknum(compare.get('post_total_damage', 0))}",
+                    f"Live minus post:      {dknum(compare.get('difference_live_minus_post', 0))}",
+                    f"Exact matched events: {compare.get('matched_exact', 0)}",
+                    f"Amount disagreement:  {compare.get('matched_amount_mismatch', 0)}",
+                    f"Only in live / post:  {compare.get('live_only', 0)} / {compare.get('post_only', 0)}",
+                ])
+            else:
+                diagnostics.extend(['', 'Independent FFV1 analysis not run yet.',
+                                    'Use Reanalyze (FFV1) to compare both pipelines.'])
+            diagnostics.extend(['',
+                'Full evidence: live_ocr_lines.csv, post_numeric_validation.csv,',
+                'live_post_diagnostics.txt and live_post_event_diff.csv'])
+        except Exception:
+            pass
         self.diag_text.config(state="normal")
         self.diag_text.delete("1.0", "end")
         self.diag_text.insert("1.0", "\n".join(diagnostics))
@@ -4008,7 +4058,7 @@ class App(tk.Tk):
         buttons = ttk.Frame(win)
         buttons.pack(fill="x", padx=14, pady=(0, 14))
         ttk.Button(buttons, text="Open analysis", command=open_selected).pack(side="left")
-        ttk.Button(buttons, text="Reanalyze", command=reanalyze_selected).pack(side="left", padx=(8, 0))
+        ttk.Button(buttons, text="Reanalyze FFV1", command=reanalyze_selected).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Open folder", command=folder_selected).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Close", command=win.destroy).pack(side="right")
 
