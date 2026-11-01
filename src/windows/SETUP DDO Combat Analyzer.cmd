@@ -144,20 +144,69 @@ echo   !PYEXE!
 echo.
 
 echo [3/6] Checking FFmpeg...
-winget list --id Gyan.FFmpeg --exact >nul 2>nul
-if errorlevel 1 (
+set "FFMPEGEXE="
+
+rem Do not use "winget list" here. It can wait for an interactive source
+rem prompt while its output is hidden, which makes setup appear frozen.
+for /f "usebackq delims=" %%I in (`where ffmpeg.exe 2^>nul`) do (
+    if not defined FFMPEGEXE set "FFMPEGEXE=%%I"
+)
+
+rem WinGet portable packages are not always available on PATH in the current
+rem CMD session, so also search WinGet's local package directory directly.
+if not defined FFMPEGEXE if exist "%LOCALAPPDATA%\Microsoft\WinGet\Packages" (
+    for /f "usebackq delims=" %%I in (`where /r "%LOCALAPPDATA%\Microsoft\WinGet\Packages" ffmpeg.exe 2^>nul`) do (
+        if not defined FFMPEGEXE set "FFMPEGEXE=%%I"
+    )
+)
+
+if not defined FFMPEGEXE (
     echo FFmpeg not found. Installing...
-    winget install --id Gyan.FFmpeg --exact --source winget ^
-        --accept-source-agreements --accept-package-agreements
+    echo.
+    winget install -e --id Gyan.FFmpeg --source winget ^
+        --accept-source-agreements --accept-package-agreements --disable-interactivity
     if errorlevel 1 (
         echo.
         echo ERROR: FFmpeg installation failed.
+        echo You can try this command manually:
+        echo   winget install -e --id Gyan.FFmpeg
+        echo.
         pause
         exit /b 4
     )
-) else (
-    echo FFmpeg: OK
+
+    rem Locate the newly installed executable without relying on PATH refresh.
+    for /f "usebackq delims=" %%I in (`where ffmpeg.exe 2^>nul`) do (
+        if not defined FFMPEGEXE set "FFMPEGEXE=%%I"
+    )
+    if not defined FFMPEGEXE if exist "%LOCALAPPDATA%\Microsoft\WinGet\Packages" (
+        for /f "usebackq delims=" %%I in (`where /r "%LOCALAPPDATA%\Microsoft\WinGet\Packages" ffmpeg.exe 2^>nul`) do (
+            if not defined FFMPEGEXE set "FFMPEGEXE=%%I"
+        )
+    )
 )
+
+if not defined FFMPEGEXE (
+    echo.
+    echo ERROR: FFmpeg was installed/found, but setup could not locate ffmpeg.exe.
+    echo Close this window, open it again, and rerun setup.
+    echo.
+    pause
+    exit /b 4
+)
+
+"!FFMPEGEXE!" -version >nul 2>nul
+if errorlevel 1 (
+    echo.
+    echo ERROR: FFmpeg was found, but it could not be started:
+    echo   !FFMPEGEXE!
+    echo.
+    pause
+    exit /b 4
+)
+
+echo FFmpeg: OK
+echo   !FFMPEGEXE!
 echo.
 
 echo [4/6] Installing/updating core Python packages...
