@@ -35,6 +35,7 @@ jobs:
                   ast.parse(p.read_text(encoding='utf-8'), filename=str(p))
               assert (internal / 'update_manager.py').is_file()
               assert 'UpdateController(' in (internal / 'DDO Combat Analyzer.pyw').read_text()
+              assert 'self.version_label = ttk.Label' in (internal / 'DDO Combat Analyzer.pyw').read_text()
               print(platform, 'Python syntax and updater UI OK')
           PY
 
@@ -87,6 +88,7 @@ jobs:
           DDO Combat Analyzer for Windows and Linux (X11).
 
           - **New:** Opt-in update check at startup, with automatic installer, manual download and defer options. SHA-256 verified against the GitHub release metadata.
+          - **New:** Installed release version shown next to System status in the main window, read directly from VERSION.txt.
           - **Improved:** Replay progress stability, early live/replay line tracking, damage-number and attack/critical parsing, and live OCR diagnostics.
           - **Windows:** Download DDO-Combat-Analyzer-Windows.zip, extract it, run SETUP DDO Combat Analyzer.cmd once, then START DDO Combat Analyzer.cmd.
           - **Linux (Mint/Cinnamon X11):** Download DDO-Combat-Analyzer-Linux.zip, extract it, run bash 'SETUP DDO Combat Analyzer.sh' once, then ./START_DDO_COMBAT_ANALYZER.sh.

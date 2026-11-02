@@ -24,10 +24,17 @@ HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "config.json"
 
 from cpu_utils import physical_core_count, resolve_indra_threads
-from update_manager import UpdateController
+from update_manager import UpdateController, local_revision
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 SW_RESTORE = 9
+
+
+def installed_version_label():
+    """Show the exact source revision from the installed GitHub release."""
+    revision = local_revision(HERE.parent)
+    return f"v{revision[:8]}" if revision else "Local build"
+
 
 # ----------------------------- helpers -------------------------------------
 
@@ -682,6 +689,10 @@ class App(tk.Tk):
 
         self.system_label = ttk.Label(top, text="System check ...")
         self.system_label.pack(side="right", padx=(8, 0))
+        # GitHub builds embed their exact commit in VERSION.txt. The label is
+        # intentionally read at startup so an update shows the new version.
+        self.version_label = ttk.Label(top, text=installed_version_label(), style="Small.TLabel")
+        self.version_label.pack(side="right", padx=(8, 0))
         self.system_button = ttk.Button(top, text="System check", command=self.show_system_check)
         self.system_button.pack(side="right")
         self.about_button = ttk.Button(top, text="About", command=self.show_about)
