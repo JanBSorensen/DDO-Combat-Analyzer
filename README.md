@@ -4,6 +4,16 @@ DDO Combat Analyzer is a non-invasive combat analysis tool for **Dungeons & Drag
 
 It reads the visible Combat Log from screen capture and provides live and post-combat analysis using **Indra OCR**.
 
+## Downloads
+
+Download the current platform-specific release ZIP (no Git installation required):
+
+- **[Windows ZIP](https://github.com/JanBSorensen/DDO-Combat-Analyzer/releases/latest/download/DDO-Combat-Analyzer-Windows.zip)** — extract all files and run `SETUP DDO Combat Analyzer.cmd` once, followed by `START DDO Combat Analyzer.cmd`.
+- **[Linux ZIP](https://github.com/JanBSorensen/DDO-Combat-Analyzer/releases/latest/download/DDO-Combat-Analyzer-Linux.zip)** — for Linux Mint/Cinnamon on X11. Extract and run `bash "SETUP DDO Combat Analyzer.sh"`, then `./START_DDO_COMBAT_ANALYZER.sh`.
+
+Both ZIPs are built together from the same `main` commit whenever this repository is updated.
+See the [GitHub Releases page](https://github.com/JanBSorensen/DDO-Combat-Analyzer/releases) for version history.
+
 ## Repository contents
 
 - **Windows version:** `src/windows/`

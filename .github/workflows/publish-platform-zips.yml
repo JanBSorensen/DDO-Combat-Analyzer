@@ -1,0 +1,92 @@
+name: Publish Windows and Linux download ZIPs
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: publish-platform-zips
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Package and publish both platforms
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build independently installable Windows and Linux ZIPs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/staging/windows dist/staging/linux
+          cp -a src/windows/. dist/staging/windows/
+          cp -a src/linux/. dist/staging/linux/
+          for platform in windows linux; do
+            cp LICENSE THIRD_PARTY_NOTICES.md "dist/staging/$platform/"
+            printf 'DDO Combat Analyzer\nSource commit: %s\n' "$GITHUB_SHA" > "dist/staging/$platform/VERSION.txt"
+            test -s "dist/staging/$platform/_internal/DDO Combat Analyzer.pyw"
+            test -s "dist/staging/$platform/_internal/record_optimized.py"
+            test -s "dist/staging/$platform/_internal/process_latest.py"
+            test -s "dist/staging/$platform/LICENSE"
+          done
+          test -s 'dist/staging/windows/SETUP DDO Combat Analyzer.cmd'
+          test -s 'dist/staging/windows/START DDO Combat Analyzer.cmd'
+          test -s 'dist/staging/linux/SETUP DDO Combat Analyzer.sh'
+          test -s 'dist/staging/linux/START_DDO_COMBAT_ANALYZER.sh'
+          chmod +x 'dist/staging/linux/SETUP DDO Combat Analyzer.sh' \
+                   'dist/staging/linux/START_DDO_COMBAT_ANALYZER.sh'
+          (
+            cd dist/staging/windows
+            zip -q -r -9 -X ../../DDO-Combat-Analyzer-Windows.zip .
+          )
+          (
+            cd dist/staging/linux
+            zip -q -r -9 -X ../../DDO-Combat-Analyzer-Linux.zip .
+          )
+          unzip -tqq dist/DDO-Combat-Analyzer-Windows.zip
+          unzip -tqq dist/DDO-Combat-Analyzer-Linux.zip
+          unzip -p dist/DDO-Combat-Analyzer-Windows.zip \
+            'SETUP DDO Combat Analyzer.cmd' >/dev/null
+          unzip -p dist/DDO-Combat-Analyzer-Linux.zip \
+            'SETUP DDO Combat Analyzer.sh' >/dev/null
+          sha256sum dist/DDO-Combat-Analyzer-*.zip
+
+      - name: Publish a versioned GitHub Release with both ZIPs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA:0:8}"
+          tag="v$(date -u +%Y.%m.%d)-${short_sha}"
+          cat > dist/RELEASE_NOTES.md <<EOF
+          DDO Combat Analyzer release for Windows and Linux (X11).
+
+          - **Windows:** Download DDO-Combat-Analyzer-Windows.zip, extract it, and run SETUP DDO Combat Analyzer.cmd once. Then use START DDO Combat Analyzer.cmd.
+          - **Linux (Mint/Cinnamon X11):** Download DDO-Combat-Analyzer-Linux.zip, extract it, and run bash 'SETUP DDO Combat Analyzer.sh' once. Then use ./START_DDO_COMBAT_ANALYZER.sh.
+          - Both ZIP files include application source and license notices. Dependencies, Indra OCR model weights, and FFmpeg are installed/downloaded separately by the setup scripts.
+          - Original project source is Apache-2.0; third-party dependencies and Indra model weights have separate licenses.
+          - Source commit: ${GITHUB_SHA}.
+          EOF
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" \
+              dist/DDO-Combat-Analyzer-Windows.zip \
+              dist/DDO-Combat-Analyzer-Linux.zip --clobber
+            gh release edit "$tag" --notes-file dist/RELEASE_NOTES.md --latest
+          else
+            gh release create "$tag" \
+              dist/DDO-Combat-Analyzer-Windows.zip \
+              dist/DDO-Combat-Analyzer-Linux.zip \
+              --target "$GITHUB_SHA" \
+              --title "DDO Combat Analyzer (${tag})" \
+              --notes-file dist/RELEASE_NOTES.md \
+              --latest
+          fi
