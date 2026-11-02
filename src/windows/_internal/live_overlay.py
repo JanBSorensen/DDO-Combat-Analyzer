@@ -30,6 +30,8 @@ DEFAULT_LIVE_WINDOW_SECONDS = 15.0
 
 from cpu_utils import resolve_indra_threads
 from live_ocr_log import new_row, write_log
+from live_input_diagnostics import LiveInputDiagnostics
+from focus_resume_guard import recover_append_rows
 
 OCR_DIGIT_MAP = str.maketrans({
     "S": "5",
@@ -662,6 +664,44 @@ def crop_blank_to_filled_lines(prev_feat, curr_gray, curr_feat, phase, line_heig
             crops.append(curr_gray[y0:y1].copy())
     return crops
 
+def crop_append_with_phase_tolerance(prev_feat, curr_gray, curr_feat,
+                                     prev_phase, phase, line_height):
+    """Recover top-aligned appends after a harmless one-pixel grid-phase jump.
+
+    A nearly empty DDO Combat Log can change its estimated grid phase by one
+    pixel when the first combat messages appear.  The ordinary append detector
+    rejected the whole new batch because prev_phase != phase, even though the
+    text was added in previously empty rows and the window did not scroll.
+
+    For an unchanged phase retain the existing algorithm exactly.  For a
+    one-pixel change only, require an append-only, still-not-full log: the last
+    three complete cells in BOTH images must remain empty, and no previously
+    text-filled cell may have become blank.  This protects against attributing
+    a partially animated scroll to appended lines (which would double-count).
+    """
+    if prev_feat is None or prev_phase is None:
+        return []
+    lh = max(1, int(line_height))
+    prev_phase, phase = int(prev_phase), int(phase)
+    if prev_phase == phase:
+        return crop_blank_to_filled_lines(prev_feat, curr_gray, curr_feat, phase, lh)
+    if circular_phase_distance(prev_phase, phase, lh) != 1:
+        return []
+    cells = line_cells(curr_gray, phase, lh)
+    if len(cells) < 8:
+        return []
+    prev_levels = [float(np.mean(prev_feat[y0:y1])) / 255.0 for y0, y1 in cells]
+    curr_levels = [float(np.mean(curr_feat[y0:y1])) / 255.0 for y0, y1 in cells]
+    if any(v >= 0.0020 for v in prev_levels[-3:]):
+        return []
+    if any(v >= 0.0020 for v in curr_levels[-3:]):
+        return []
+    # Do not turn disappearing/scrolling old rows into new OCR events.
+    if any(p >= 0.008 and c < 0.003 for p, c in zip(prev_levels, curr_levels)):
+        return []
+    return crop_blank_to_filled_lines(prev_feat, curr_gray, curr_feat, phase, lh)
+
+
 def preprocess_line(line_gray):
     line = cv2.copyMakeBorder(line_gray, 4, 4, 3, 3, cv2.BORDER_REPLICATE)
     line = cv2.resize(line, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC)
@@ -812,6 +852,9 @@ class LiveEstimator:
         self.live_ocr_records_lock = threading.Lock()
         self.live_ocr_records = []
         self.ocr_batch_inflight = ()
+        # Activated only while a combat session is being recorded. This
+        # avoids collecting idle Combat Log lines or entire desktops.
+        self.capture_diagnostics = None
         self.live_raw_damage_total = 0
         self.live_corrected_damage_total = 0
         self.scan_path = Path(os.devnull)
@@ -1080,7 +1123,9 @@ class LiveEstimator:
         canvas, slots = build_indra_batch(items)
         if canvas is None:
             return [""] * len(items)
+        indra_started = time.perf_counter()
         page = self.indra_converter.ocr(canvas)
+        diagnostic_batch_ms = (time.perf_counter() - indra_started) * 1000.0
         by_slot = [[] for _ in items]
         for line in getattr(page, "lines", []) or []:
             text = normalize_text(getattr(line, "text", "") or "")
@@ -1106,7 +1151,18 @@ class LiveEstimator:
                     best = i
             if best is not None:
                 by_slot[best].append(text)
-        return [normalize_text(" ".join(parts)) for parts in by_slot]
+        texts = [normalize_text(" ".join(parts)) for parts in by_slot]
+        # Observe the actual pixels sent to the OCR model, not an
+        # independent re-creation of the crop from the saved video.
+        diag = self.capture_diagnostics
+        if diag is not None:
+            try:
+                diag.record_batch(items, canvas, slots, page, texts,
+                                  batch_ms=diagnostic_batch_ms,
+                                  queue_depth=self.ocr_queue.qsize())
+            except Exception:
+                pass  # Diagnostics must never affect damage parsing.
+        return texts
 
     def _ocr_indra_prepared(self, image):
         page = self.indra_converter.ocr(image)
@@ -1481,6 +1537,10 @@ class LiveEstimator:
             align_feat = None
             align_phase = None
             align_age_frames = 0
+            pre_focus_feat = None
+            pre_focus_phase = None
+            pre_focus_line_height = None
+            focus_resume_pending = False
 
             baseline_path = self.session / "baseline_gray.png"
             if baseline_path.exists():
@@ -1548,6 +1608,9 @@ class LiveEstimator:
                     if not is_ddo_foreground():
                         if not capture_paused_for_focus:
                             capture_paused_for_focus = True
+                            pre_focus_feat = prev_feat
+                            pre_focus_phase = prev_phase
+                            pre_focus_line_height = self.line_height
                             self.write_status(capture_paused_no_ddo_focus=True)
                         prev_gray = None
                         prev_feat = None
@@ -1579,6 +1642,7 @@ class LiveEstimator:
 
                     if capture_paused_for_focus:
                         capture_paused_for_focus = False
+                        focus_resume_pending = True
                         # Treat the first visible DDO frame as a fresh visual
                         # baseline. Anything that happened while DDO was hidden
                         # cannot be reconstructed reliably from screen OCR.
@@ -1595,6 +1659,14 @@ class LiveEstimator:
                     shot = sct.grab(region)
                     bgra = np.asarray(shot, dtype=np.uint8)
                     gray = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
+                    diag = self.capture_diagnostics
+                    if diag is not None:
+                        # This is the real live MSS grab, before visual
+                        # tracking, row extraction or Indra preprocessing.
+                        try:
+                            diag.capture_frame(elapsed, bgra, gray)
+                        except Exception:
+                            pass
                     feat = fast_text_feature(gray)
                     self.tracking_frames += 1
 
@@ -1661,6 +1733,20 @@ class LiveEstimator:
                         align_phase = phase
                         align_age_frames = 0
                         anchor_action = "baseline"
+                        if focus_resume_pending:
+                            resume_crops = (recover_append_rows(
+                                pre_focus_feat, gray, feat, pre_focus_phase,
+                                phase, self.line_height, scale=255.0)
+                                if pre_focus_line_height == self.line_height else [])
+                            for crop in resume_crops:
+                                self.enqueue_new_lines([crop], elapsed)
+                            crops = list(resume_crops)
+                            decision = "focus-resume-append" if crops else "focus-resume-baseline"
+                            anchor_action = decision
+                            focus_resume_pending = False
+                            pre_focus_feat = None
+                            pre_focus_phase = None
+                            pre_focus_line_height = None
                     else:
                         phase_delta = circular_phase_distance(
                             phase, align_phase, self.line_height
@@ -1749,14 +1835,15 @@ class LiveEstimator:
                             not crop_entries
                             and shift == 0
                             and prev_feat is not None
-                            and prev_phase == phase
                         ):
-                            append_crops = crop_blank_to_filled_lines(
-                                prev_feat, gray, feat, phase, self.line_height
+                            append_crops = crop_append_with_phase_tolerance(
+                                prev_feat, gray, feat, prev_phase, phase,
+                                self.line_height,
                             )
                             if append_crops:
                                 crop_entries.extend((elapsed, crop) for crop in append_crops)
-                                decision += "+append"
+                                decision += ("+append" if prev_phase == phase
+                                             else "+append-phase-tolerant")
 
                         for crop_elapsed, crop in crop_entries:
                             self.enqueue_new_lines([crop], crop_elapsed)

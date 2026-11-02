@@ -22,6 +22,22 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Validate Python syntax for both platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import ast
+          from pathlib import Path
+          for platform in ('windows', 'linux'):
+              internal = Path('src') / platform / '_internal'
+              for p in [*internal.glob('*.py'), *internal.glob('*.pyw')]:
+                  ast.parse(p.read_text(encoding='utf-8'), filename=str(p))
+              assert (internal / 'update_manager.py').is_file()
+              assert 'UpdateController(' in (internal / 'DDO Combat Analyzer.pyw').read_text()
+              print(platform, 'Python syntax and updater UI OK')
+          PY
+
       - name: Build independently installable Windows and Linux ZIPs
         shell: bash
         run: |
@@ -35,7 +51,9 @@ jobs:
             test -s "dist/staging/$platform/_internal/DDO Combat Analyzer.pyw"
             test -s "dist/staging/$platform/_internal/record_optimized.py"
             test -s "dist/staging/$platform/_internal/process_latest.py"
+            test -s "dist/staging/$platform/_internal/update_manager.py"
             test -s "dist/staging/$platform/LICENSE"
+            test ! -e "dist/staging/$platform/LOCAL_TEST_VERSION.txt"
           done
           test -s 'dist/staging/windows/SETUP DDO Combat Analyzer.cmd'
           test -s 'dist/staging/windows/START DDO Combat Analyzer.cmd'
@@ -53,13 +71,11 @@ jobs:
           )
           unzip -tqq dist/DDO-Combat-Analyzer-Windows.zip
           unzip -tqq dist/DDO-Combat-Analyzer-Linux.zip
-          unzip -p dist/DDO-Combat-Analyzer-Windows.zip \
-            'SETUP DDO Combat Analyzer.cmd' >/dev/null
-          unzip -p dist/DDO-Combat-Analyzer-Linux.zip \
-            'SETUP DDO Combat Analyzer.sh' >/dev/null
+          unzip -p dist/DDO-Combat-Analyzer-Windows.zip 'VERSION.txt' | grep -F "$GITHUB_SHA"
+          unzip -p dist/DDO-Combat-Analyzer-Linux.zip 'VERSION.txt' | grep -F "$GITHUB_SHA"
           sha256sum dist/DDO-Combat-Analyzer-*.zip
 
-      - name: Publish a versioned GitHub Release with both ZIPs
+      - name: Publish versioned GitHub Release containing both platforms
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -68,12 +84,15 @@ jobs:
           short_sha="${GITHUB_SHA:0:8}"
           tag="v$(date -u +%Y.%m.%d)-${short_sha}"
           cat > dist/RELEASE_NOTES.md <<EOF
-          DDO Combat Analyzer release for Windows and Linux (X11).
+          DDO Combat Analyzer for Windows and Linux (X11).
 
-          - **Windows:** Download DDO-Combat-Analyzer-Windows.zip, extract it, and run SETUP DDO Combat Analyzer.cmd once. Then use START DDO Combat Analyzer.cmd.
-          - **Linux (Mint/Cinnamon X11):** Download DDO-Combat-Analyzer-Linux.zip, extract it, and run bash 'SETUP DDO Combat Analyzer.sh' once. Then use ./START_DDO_COMBAT_ANALYZER.sh.
-          - Both ZIP files include application source and license notices. Dependencies, Indra OCR model weights, and FFmpeg are installed/downloaded separately by the setup scripts.
-          - Original project source is Apache-2.0; third-party dependencies and Indra model weights have separate licenses.
+          - **New:** Opt-in update check at startup, with automatic installer, manual download and defer options. SHA-256 verified against the GitHub release metadata.
+          - **Improved:** Replay progress stability, early live/replay line tracking, damage-number and attack/critical parsing, and live OCR diagnostics.
+          - **Windows:** Download DDO-Combat-Analyzer-Windows.zip, extract it, run SETUP DDO Combat Analyzer.cmd once, then START DDO Combat Analyzer.cmd.
+          - **Linux (Mint/Cinnamon X11):** Download DDO-Combat-Analyzer-Linux.zip, extract it, run bash 'SETUP DDO Combat Analyzer.sh' once, then ./START_DDO_COMBAT_ANALYZER.sh.
+          - **Data safety:** Updating keeps existing config.json, capture area, OCR/Python installations and combat sessions.
+          - **Known investigation:** Live OCR truncation on a particular Windows system is still under investigation; no speculative parsing workaround is included.
+          - Both ZIPs include the application source and license notices. Third-party dependencies and Indra model weights have separate licenses.
           - Source commit: ${GITHUB_SHA}.
           EOF
           if gh release view "$tag" >/dev/null 2>&1; then
@@ -90,3 +109,24 @@ jobs:
               --notes-file dist/RELEASE_NOTES.md \
               --latest
           fi
+
+          # Verify BOTH download files before deleting ANY previous release.
+          current_assets="$(gh release view "$tag" --json assets --jq '.assets[].name')"
+          grep -Fx 'DDO-Combat-Analyzer-Windows.zip' <<<"$current_assets"
+          grep -Fx 'DDO-Combat-Analyzer-Linux.zip' <<<"$current_assets"
+
+          # User requested exactly ONE publicly available GitHub Release.
+          # Never delete the newly published one. --cleanup-tag also removes
+          # historical version tags, so the Releases page shows one version.
+          while IFS= read -r old_tag; do
+            [[ -z "$old_tag" || "$old_tag" == "$tag" ]] && continue
+            echo "Removing superseded release: $old_tag"
+            gh release delete "$old_tag" --yes --cleanup-tag
+          done < <(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')
+
+          remaining="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq '.[].tag_name')"
+          [[ "$remaining" == "$tag" ]] || {
+            echo "Unexpected remaining Releases: $remaining" >&2
+            exit 1
+          }
+          echo "Published and verified the sole release: $tag"

@@ -63,7 +63,7 @@ class NumericGuard:
         self.trusted_live = trusted_live or {}
         self.rows = []
         self.stats = {'accepted':0, 'lookalike':0, 'verified':0, 'comma_inferred':0,
-                      'collapsed_11':0, 'rejected':0, 'unresolved_11':0}
+                      'collapsed_11':0, 'confirmed_11':0, 'rejected':0, 'unresolved_11':0}
         self._recheck_cache = {}
         self.ocr_seconds = 0.0
 
@@ -166,8 +166,16 @@ class NumericGuard:
                     result, evidence = match
                     action = 'collapsed_11'
                 elif candidates:
-                    action = 'unresolved_11'
-                    evidence = ' | '.join(alternatives)[:240]
+                    # The original amount can already be confirmed by a fresh
+                    # OCR read.  A doubled '11' is only a *possibility*, not a
+                    # reason to mark that confirmed number as unresolved.
+                    same = next(((v, txt) for v, txt in verified if v == initial), None)
+                    if same:
+                        action = 'confirmed_11'
+                        evidence = same[1]
+                    else:
+                        action = 'unresolved_11'
+                        evidence = ' | '.join(alternatives)[:240]
 
         self.stats[action] = self.stats.get(action, 0) + 1
         if result is None or result != initial or action not in ('accepted',):

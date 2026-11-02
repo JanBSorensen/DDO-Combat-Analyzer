@@ -23,6 +23,8 @@ CONFIG_PATH = HERE / "config.json"
 
 from cpu_utils import physical_core_count, resolve_indra_threads
 from post_numeric_guard import NumericGuard
+from attack_mode_audit import save as save_attack_audit
+from focus_resume_guard import recover_append_rows
 from live_ocr_log import read_log
 from live_post_diagnostics import reconcile
 
@@ -1101,7 +1103,7 @@ def canonical_target(s):
 
 
 COMBAT_MESSAGE_START_RE = re.compile(
-    r"^\s*[|\[\]{}Il1:;`'\".,_\-„“”]{0,3}\s*\(?\s*Combat\s*\)?\s*:",
+    r"^\s*(?:V\s+)?[|\[\]{}Il1:;`'\".,_\-„“”]{0,3}\s*\(?\s*Combat\s*\)?\s*:",
     re.IGNORECASE,
 )
 
@@ -2908,9 +2910,16 @@ def main():
             phase = best_grid_phase(gray, line_height, feat=feat)
             recon_profile["grid_phase_detection"] += time.perf_counter() - _t
             last_phase = phase
+            safe_focus_crops = recover_append_rows(
+                prev_feat, gray, feat, prev_phase, phase, line_height, scale=1.0)
+            for crop in safe_focus_crops:
+                visual_lines.append(crop)
+                visual_line_meta.append((frame_no, saved_frame_times.get(frame_no)))
+            focus_decision = ("focus-resume-append" if safe_focus_crops
+                              else "focus-resume baseline")
             _t = time.perf_counter()
             align_w.writerow([
-                frame_no, 0, 0, 1.0, 1.0, "focus-resume baseline", phase,
+                frame_no, 0, len(safe_focus_crops), 1.0, 1.0, focus_decision, phase,
                 True, 1.0, 0.0, False, "", "", ""
             ])
             recon_profile["reconstruction_logging_progress"] += time.perf_counter() - _t
@@ -3327,6 +3336,7 @@ def main():
     # FFV1 is the independent post reference. Preserve its event-level output
     # separately from the earlier instant/live-derived report.
     shutil.copy2(session / 'damage_events.csv', session / 'ffv1_post_damage_events.csv')
+    save_attack_audit(session, 'ffv1_post', attacks, confirms)
     shutil.copy2(session / 'COMBAT_REPORT.txt', session / 'ffv1_post_COMBAT_REPORT.txt')
     summary_path = session / 'analysis_summary.json'
     analysis_summary = json.loads(summary_path.read_text(encoding='utf-8'))
@@ -3370,6 +3380,7 @@ def _fast_live_analysis(session, log_rows, log_metadata):
     t0 = time.perf_counter()
     times = []
     texts = []
+    valid_rows = []
     for row in log_rows:
         try:
             ts = float(row.get('capture_elapsed_seconds', ''))
@@ -3378,6 +3389,7 @@ def _fast_live_analysis(session, log_rows, log_metadata):
         text = normalize_text(row.get('effective_ocr_text') or row.get('raw_ocr_text') or '')
         times.append(max(0.0, ts))
         texts.append(text)
+        valid_rows.append(row)
     (session / 'combat_log_live.txt').write_text('\n'.join(texts) + '\n', encoding='utf-8')
     # The GUI's no-activity check expects combat_log.txt. Do not overwrite an
     # independent FFV1 OCR file if the user later runs the quick parser again.
@@ -3387,20 +3399,27 @@ def _fast_live_analysis(session, log_rows, log_metadata):
     print('PROGRESS|PREPARE|1|1', flush=True)
     wrap_stats = {}
     messages, message_times, message_lines = reassemble_wrapped_damage_rows(texts, times, stats=wrap_stats)
-    # Map successful live numeric checks to the source OCR row. For two-line
-    # wraps the verification belongs to the first row's event capture time.
-    by_capture = {}
-    for i, row in enumerate(log_rows):
-        try:
-            event_t = float(row.get('event_capture_elapsed_seconds',''))
-        except (ValueError, TypeError):
-            continue
-        result = row.get('numeric_recheck_result', '')
+    # Associate live numeric checks with the exact OCR ROW, never a timestamp:
+    # one 30-fps capture can contain several independently verified hits.
+    # Preserve the mapping for two-row wraps, where the OCR worker may put the
+    # successful check on the continuation row, but the parser reports the
+    # first row's number. Never propagate checks to other same-time hits.
+    trusted = {}
+    for idx, row in enumerate(valid_rows):
+        result = (row.get('numeric_recheck_result') or '').strip()
         amount = row.get('parsed_outgoing_damage', '')
-        if result and amount not in ('', None):
-            by_capture[round(event_t, 4)] = {'result':result, 'final':amount}
-    trusted = {i+1: by_capture[round(ts, 4)] for i,ts in enumerate(times)
-               if round(ts, 4) in by_capture}
+        if not result or amount in ('', None):
+            continue
+        first_idx = idx
+        if idx > 0:
+            preceding = normalize_text(texts[idx-1])
+            following = normalize_text(texts[idx])
+            kind = damage_wrap_kind(preceding)
+            if kind and not COMBAT_MESSAGE_START_RE.match(following):
+                joined = join_damage_wrap(preceding, following, kind)
+                if joined and ((OUT_RE.search(joined) or OUT_UNTYPED_RE.search(joined)) is not None):
+                    first_idx = idx-1
+        trusted[first_idx+1] = {'result':result, 'final':amount}
     guard = NumericGuard(trusted_live=trusted)
     outgoing, incoming, healing, corrections, suspicious = parse_combat_events(
         messages, message_times, message_lines, resolver=guard.resolve)
@@ -3414,6 +3433,7 @@ def _fast_live_analysis(session, log_rows, log_metadata):
     create_reports(session, texts, outgoing, incoming, healing, attacks, confirms,
                    defensive_misses, corrections, suspicious, 0, len(texts))
     shutil.copy2(session / 'damage_events.csv', session / 'fast_live_damage_events.csv')
+    save_attack_audit(session, 'fast_live', attacks, confirms)
     report_path = session / 'COMBAT_REPORT.txt'
     report_path.write_text(
         'FAST RESULTS FROM LIVE OCR - NOT INDEPENDENT FFV1 POST ANALYSIS\n'

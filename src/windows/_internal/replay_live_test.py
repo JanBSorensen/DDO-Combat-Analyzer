@@ -7,6 +7,13 @@ import queue
 import threading
 import time
 from collections import deque
+import math
+import traceback
+
+from live_ocr_log import COLUMNS as OCR_COLUMNS
+from three_mode_compare import generate as generate_three_mode_comparison
+from attack_mode_audit import save_from_replay_ocr
+from focus_resume_guard import recover_append_rows
 from pathlib import Path
 
 import cv2
@@ -15,7 +22,7 @@ from live_overlay import (
     LiveEstimator,
     best_grid_phase_from_feature,
     circular_phase_distance,
-    crop_blank_to_filled_lines,
+    crop_append_with_phase_tolerance,
     crop_new_lines,
     detect_line_height_from_gray,
     estimate_shift_fast,
@@ -42,12 +49,99 @@ class ReplayLiveEstimator(LiveEstimator):
         self.overlay_error_path = session / "replay_live_error.txt"
         self._last_progress_print = 0.0
         self._last_progress_ocr = -1
+        self._last_ocr_progress_at = time.monotonic()
+        self._last_ocr_health_count = 0
+        self.ocr_worker_failure = ""
+        self.ocr_worker_thread = None
+        self.start_epoch = self._original_start_epoch(session)
+
+    @staticmethod
+    def _original_start_epoch(session: Path):
+        """A replay has no live wait_for_clock() call: restore the saved clock.
+
+        This is mandatory: LiveEstimator.record_live_ocr_line() creates wall
+        timestamps using start_epoch and crashes if it remains None.
+        """
+        sources = [
+            (session / "recording_clock.json", "start_epoch"),
+            (session / "live_ocr_complete.json", "capture_start_epoch"),
+        ]
+        for path, field in sources:
+            try:
+                val = float(json.loads(path.read_text(encoding="utf-8"))[field])
+                if math.isfinite(val) and val > 0:
+                    return val
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+        # Files from old recordings may lack clock metadata. Their replay
+        # relative timestamps are still usable; use an explicit fallback epoch.
+        return time.time()
+
+    def _check_worker_health(self, max_stall_seconds=120.0):
+        """Do not block forever when the separate OCR worker has died/stalled."""
+        if self.ocr_worker_failure:
+            raise RuntimeError("Replay OCR worker failed. See replay_live_error.txt: "
+                               + self.ocr_worker_failure.splitlines()[-1])
+        if self.ocr_worker_thread is not None and not self.ocr_worker_thread.is_alive():
+            raise RuntimeError("Replay OCR worker stopped before its queue was drained. "
+                               "See replay_live_error.txt or the replay output.")
+        if self.stop_event.is_set():
+            raise RuntimeError("Replay OCR worker stopped unexpectedly before completion.")
+        if time.monotonic() - self._last_ocr_progress_at > max_stall_seconds:
+            raise RuntimeError("Replay OCR did not complete a batch for over "
+                               f"{max_stall_seconds:g} seconds. Aborting instead of hanging.")
+
+    def ocr_worker(self):
+        """Propagate previously silent worker crashes to the replay process."""
+        try:
+            super().ocr_worker()
+        except BaseException:
+            self.ocr_worker_failure = traceback.format_exc()
+            self.stop_event.set()
+            try:
+                self.overlay_error_path.write_text(self.ocr_worker_failure, encoding="utf-8")
+            except OSError:
+                pass
+            print("REPLAY_ERROR|OCR worker failed: "
+                  + self.ocr_worker_failure.splitlines()[-1], flush=True)
+
+    def write_live_ocr_log(self):
+        """Keep original live OCR evidence intact; write replay-only outputs."""
+        with self.live_ocr_records_lock:
+            rows = list(self.live_ocr_records)
+        rows.sort(key=lambda r: (float(r.get("capture_elapsed_seconds") or 0),
+                                 float(r.get("ocr_finished_wall_epoch") or 0)))
+        path = self.session / "replay_live_ocr_lines.csv"
+        temp = path.with_name(path.name + ".tmp")
+        with temp.open("w", newline="", encoding="utf-8") as file:
+            writer = csv.DictWriter(file, fieldnames=OCR_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for i, row in enumerate(rows, 1):
+                writer.writerow(dict(row, line_number=i))
+        temp.replace(path)
+        meta_path = self.session / "replay_live_ocr_complete.json"
+        metadata = {
+            "format_version": 1,
+            "ready": True,
+            "capture_ocr_complete": True,
+            "ocr_queue_drained": True,
+            "recognized_lines": len(rows),
+            "dropped_line_crops": int(self.dropped_lines_total),
+            "capture_start_epoch": self.start_epoch,
+            "note": "Offline replay OCR; original live OCR files are unchanged",
+        }
+        temp_meta = meta_path.with_name(meta_path.name + ".tmp")
+        temp_meta.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        temp_meta.replace(meta_path)
 
     def write_status(self, **updates):
         # The OCR worker calls this periodically.  Surface coarse progress to the
         # GUI without flooding stdout with one line per OCR batch.
         now = time.monotonic()
         ocr = int(updates.get("ocr_lines_total", self.ocr_lines_total) or 0)
+        if ocr > self._last_ocr_health_count:
+            self._last_ocr_health_count = ocr
+            self._last_ocr_progress_at = now
         if ocr != self._last_progress_ocr and now - self._last_progress_print >= 0.45:
             self._last_progress_ocr = ocr
             self._last_progress_print = now
@@ -59,15 +153,16 @@ class ReplayLiveEstimator(LiveEstimator):
     def _enqueue_one_line(self, crop, elapsed, block_timeout=0.0, completion_event=None):
         """Offline replay: wait for OCR capacity rather than create fake drops."""
         item = (float(elapsed), crop, completion_event)
-        while not self.stop_event.is_set():
+        while True:
+            self._check_worker_health()
             try:
                 self.ocr_queue.put(item, timeout=0.20)
                 self.detected_lines_total += 1
                 return True
             except queue.Full:
-                continue
-        self.dropped_lines_total += 1
-        return False
+                # In the old implementation this loop was unbounded when the
+                # OCR thread crashed and the 512-line queue became full.
+                self._check_worker_health()
 
 
 def read_capture_index(session: Path):
@@ -210,6 +305,11 @@ def run_replay(session: Path):
         raise RuntimeError("The selected capture contains no saved video frames.")
     resume_frames = read_focus_resume_frames(session)
 
+    # Stale replay results must not be confused with the current run.
+    for name in ("replay_live_error.txt", "replay_live_summary.json",
+                 "replay_live_ocr_complete.json"):
+        (session / name).unlink(missing_ok=True)
+
     est = ReplayLiveEstimator(session)
     est.live_event_records = []
     est.live_raw_damage_total = 0
@@ -228,6 +328,10 @@ def run_replay(session: Path):
     align_feat = None
     align_phase = None
     align_age_frames = 0
+    pre_focus_feat = None
+    pre_focus_phase = None
+    pre_focus_line_height = None
+    focus_resume_pending = False
     baseline = session / "baseline_gray.png"
     if baseline.exists():
         prev_gray = cv2.imread(str(baseline), cv2.IMREAD_GRAYSCALE)
@@ -244,6 +348,7 @@ def run_replay(session: Path):
         raise RuntimeError("Could not open the saved FFV1 capture video.")
 
     ocr_thread = threading.Thread(target=est.ocr_worker, name="replay-live-ocr", daemon=True)
+    est.ocr_worker_thread = ocr_thread
     ocr_thread.start()
 
     track_f = est.track_path.open("w", encoding="utf-8", newline="")
@@ -278,6 +383,7 @@ def run_replay(session: Path):
     started = time.perf_counter()
     try:
         for entry in saved_rows:
+            est._check_worker_health()
             ok, gray = cap.read()
             if not ok or gray is None:
                 raise RuntimeError(
@@ -292,6 +398,10 @@ def run_replay(session: Path):
             # The recorder forces an anchor after DDO regains focus.  Live capture
             # also resets its visual baseline there, so replay must do the same.
             if saved_frame in resume_frames:
+                pre_focus_feat = prev_feat
+                pre_focus_phase = prev_phase
+                pre_focus_line_height = est.line_height
+                focus_resume_pending = True
                 prev_gray = None
                 prev_feat = None
                 prev_phase = None
@@ -346,6 +456,18 @@ def run_replay(session: Path):
                 score = 1.0
                 zero = 1.0
                 decision = "baseline"
+                if focus_resume_pending:
+                    crops = (recover_append_rows(
+                        pre_focus_feat, gray, feat, pre_focus_phase,
+                        phase, est.line_height, scale=255.0)
+                        if pre_focus_line_height == est.line_height else [])
+                    for crop in crops:
+                        est.enqueue_new_lines([crop], elapsed)
+                    decision = "focus-resume-append" if crops else "focus-resume-baseline"
+                    focus_resume_pending = False
+                    pre_focus_feat = None
+                    pre_focus_phase = None
+                    pre_focus_line_height = None
                 align_gray = gray
                 align_feat = feat
                 align_phase = phase
@@ -423,14 +545,15 @@ def run_replay(session: Path):
                     not crop_entries
                     and shift == 0
                     and prev_feat is not None
-                    and prev_phase == phase
                 ):
-                    append_crops = crop_blank_to_filled_lines(
-                        prev_feat, gray, feat, phase, est.line_height
+                    append_crops = crop_append_with_phase_tolerance(
+                        prev_feat, gray, feat, prev_phase, phase,
+                        est.line_height,
                     )
                     if append_crops:
                         crop_entries.extend((elapsed, c) for c in append_crops)
-                        decision += "+append"
+                        decision += ("+append" if prev_phase == phase
+                                     else "+append-phase-tolerant")
 
                 for crop_elapsed, crop in crop_entries:
                     est.enqueue_new_lines([crop], crop_elapsed)
@@ -522,11 +645,18 @@ def run_replay(session: Path):
             f"REPLAY_PROGRESS|WAIT_OCR|{est.ocr_lines_total}|{est.detected_lines_total}|{est.parsed_events_total}",
             flush=True,
         )
-        est.ocr_queue.join()
+        # queue.join() had no timeout and could hang forever after an OCR
+        # worker exception. Poll instead and surface the real failure.
+        while est.ocr_queue.unfinished_tasks:
+            est._check_worker_health()
+            time.sleep(0.2)
+        est._check_worker_health()
         est.stop_event.set()
         ocr_thread.join(timeout=60.0)
         if ocr_thread.is_alive():
             raise RuntimeError("Replay OCR worker did not finish after the queue drained.")
+        if est.ocr_worker_failure:
+            raise RuntimeError("Replay OCR failed: " + est.ocr_worker_failure.splitlines()[-1])
     finally:
         cap.release()
         track_f.flush()
@@ -538,6 +668,9 @@ def run_replay(session: Path):
 
     duration = float(rows[-1]["elapsed"])
     write_replay_dps(est, duration)
+    # Independent attack/confirmation records from the replay's own OCR rows.
+    # Do not overwrite the GUI's FFV1/fast-live attack_events.csv.
+    replay_attacks, replay_confirms = save_from_replay_ocr(session)
 
     replay_total = int(est.live_corrected_damage_total)
     replay_events = int(est.parsed_events_total)
@@ -557,7 +690,8 @@ def run_replay(session: Path):
         "replay_processing_seconds": processing_seconds,
         "replay_live_damage": replay_total,
         "replay_live_damage_events": replay_events,
-        "replay_live_attack_events": int(est.parsed_attacks_total),
+        "replay_live_attack_events": int(replay_attacks),
+        "replay_live_confirm_attempts": int(replay_confirms),
         "post_damage": post_total,
         "post_damage_events": post_events,
         "damage_difference_replay_minus_post": difference,
@@ -586,6 +720,18 @@ def run_replay(session: Path):
     (session / "replay_live_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )
+    # A separate report compares the *independent* event streams. Never
+    # silently replace an OCR total with the post-analysis result.
+    try:
+        comparison = generate_three_mode_comparison(session)
+        summary['three_mode_comparison'] = comparison
+        (session / "replay_live_summary.json").write_text(
+            json.dumps(summary, indent=2), encoding="utf-8"
+        )
+        if comparison.get('all_three_damage_sequences_equal') is False:
+            print("REPLAY_INFO|The three pipelines disagree; see three_mode_mismatches.csv", flush=True)
+    except Exception as exc:
+        print(f"REPLAY_INFO|Could not write three-mode comparison: {exc}", flush=True)
 
     print(
         "REPLAY_RESULT|"

@@ -24,6 +24,7 @@ HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "config.json"
 
 from cpu_utils import physical_core_count, resolve_indra_threads
+from update_manager import UpdateController
 
 if sys.platform.startswith('linux'):
     from linux_x11 import (
@@ -650,6 +651,7 @@ class App(tk.Tk):
         self._build_style()
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.update_controller = UpdateController(self, self.update_button, HERE.parent)
 
         self.after(150, self.poll_output)
         self.after(250, self.refresh_system_status)
@@ -659,6 +661,9 @@ class App(tk.Tk):
         self.after(800, self.monitor_continuous_live)
         self.after(100, self.poll_hotkey_event)
         self.after(1100, self.show_first_run_guide_if_needed)
+
+    def check_for_updates(self):
+        self.update_controller.check(manual=True)
 
     def _build_style(self):
         style = ttk.Style(self)
@@ -699,6 +704,8 @@ class App(tk.Tk):
         self.system_button.pack(side="right")
         self.about_button = ttk.Button(top, text="About", command=self.show_about)
         self.about_button.pack(side="right", padx=(0, 8))
+        self.update_button = ttk.Button(top, text="Check for updates", command=self.check_for_updates)
+        self.update_button.pack(side="right", padx=(0, 8))
 
         # Setup / control panel
         control = ttk.LabelFrame(outer, text="Recording", padding=12)
@@ -2208,12 +2215,24 @@ class App(tk.Tk):
         self.status_label.config(text=text)
         self.status_dot.itemconfig(self.status_circle, fill=color)
 
+    def _set_determinate_progress(self, value):
+        """Set progress without resetting an already-determinate Ttk bar.
+
+        Tk 8.6's ttk::progressbar::stop configures -value 0.  It must only
+        be used to cancel an existing indeterminate timer, NOT for every
+        incoming progress message.
+        """
+        if str(self.progress.cget("mode")) == "indeterminate":
+            self.progress.stop()
+        self.progress.config(mode="determinate", maximum=100, value=value)
+
     def set_busy(self, busy, text=None):
         if busy:
             self.progress.config(mode="indeterminate")
             self.progress.start(12)
-        else:
+        elif str(self.progress.cget("mode")) == "indeterminate":
             self.progress.stop()
+        # A completed determinate progress bar remains at its final value.
         if text is not None:
             self.progress_text.config(text=text)
 
@@ -2241,8 +2260,80 @@ class App(tk.Tk):
         else:
             return
 
-        self.progress.stop()
-        self.progress.config(mode="determinate", maximum=100, value=value)
+        self._set_determinate_progress(value)
+        self.progress_text.config(text=text)
+
+    def begin_replay_progress(self, session_name):
+        """Initialize one combined meter for concurrent replay frame/OCR work."""
+        self._replay_progress_value = 0.0
+        self._replay_frames_done = 0
+        self._replay_frames_total = 0
+        self._replay_ocr_done = 0
+        self._replay_ocr_detected = 0
+        self._replay_ocr_parsed = 0
+        self._set_determinate_progress(0)
+        self.progress_text.config(text=f"Replay live test: {session_name} - preparing...")
+
+    def set_replay_progress(self, stage, current=0, total=1, extra=0):
+        """Show monotone concurrent replay progress, without phase handoff jumps.
+
+        Frames and OCR are processed simultaneously; treating their progress as
+        sequential causes a large upward jump when frame processing finishes.
+        Using a weighted, continuously updated estimate avoids that jump while
+        keeping all raw counters independent and accurate.
+        """
+        try:
+            current = max(0, int(current or 0))
+            total = max(1, int(total or 1))
+            extra = max(0, int(extra or 0))
+        except (ValueError, TypeError):
+            return
+
+        if stage == "FRAMES":
+            self._replay_frames_total = max(self._replay_frames_total, total)
+            self._replay_frames_done = max(self._replay_frames_done,
+                                          min(current, self._replay_frames_total))
+            self._replay_ocr_detected = max(self._replay_ocr_detected, extra)
+        elif stage in ("OCR", "WAIT_OCR"):
+            self._replay_ocr_done = max(self._replay_ocr_done, current)
+            self._replay_ocr_detected = max(self._replay_ocr_detected, total,
+                                            self._replay_ocr_done)
+            self._replay_ocr_parsed = max(self._replay_ocr_parsed, extra)
+            if stage == "WAIT_OCR":
+                self._replay_frames_done = self._replay_frames_total
+        elif stage == "DONE":
+            # Do not call stop() here: Tk's progressbar.stop() resets to zero.
+            self._replay_progress_value = 100.0
+            self._set_determinate_progress(100.0)
+            self.progress_text.config(text="Replay live test complete")
+            return
+        else:
+            return
+
+        frame_ratio = min(1.0, self._replay_frames_done /
+                          max(1, self._replay_frames_total))
+        detected = max(self._replay_ocr_detected, self._replay_ocr_done)
+        # If no text has been found there is no OCR backlog yet.
+        ocr_ratio = min(1.0, self._replay_ocr_done / detected) if detected else 1.0
+
+        # Frames form 65% and OCR 35% of the 5-95% processing interval.
+        # Multiply the OCR ratio by frame progress because the eventual OCR
+        # line count is unknown until all frames have been reconstructed.
+        # This keeps early OCR updates from jumping the bar to ~35%.
+        value = 5.0 + 90.0 * frame_ratio * (0.65 + 0.35 * ocr_ratio)
+        value = max(self._replay_progress_value, min(95.0, value))
+        self._replay_progress_value = value
+        self._set_determinate_progress(value)
+
+        if stage == "WAIT_OCR":
+            text = (f"Replay live: finishing OCR - "
+                    f"{self._replay_ocr_done}/{detected} lines - "
+                    f"{self._replay_ocr_parsed} damage events")
+        else:
+            text = (f"Replay live: frames "
+                    f"{self._replay_frames_done}/{max(1,self._replay_frames_total)} - "
+                    f"OCR {self._replay_ocr_done}/{detected} lines - "
+                    f"{self._replay_ocr_parsed} damage events")
         self.progress_text.config(text=text)
 
     def refresh_capture_label(self):
@@ -2650,34 +2741,10 @@ class App(tk.Tk):
             if line.startswith("REPLAY_PROGRESS|"):
                 parts = line.split("|")
                 stage = parts[1] if len(parts) > 1 else ""
-                if stage == "FRAMES" and len(parts) >= 5:
-                    try:
-                        current = int(parts[2]); total = max(1, int(parts[3])); lines = int(parts[4])
-                        value = 5 + 55 * current / total
-                        self.progress.stop()
-                        self.progress.config(mode="determinate", maximum=100, value=value)
-                        self.progress_text.config(
-                            text=f"Replay live: reconstructing {current}/{total} saved frames - {lines} lines"
-                        )
-                    except Exception:
-                        pass
-                elif stage == "OCR" and len(parts) >= 5:
-                    try:
-                        done = int(parts[2]); detected = max(1, int(parts[3])); parsed = int(parts[4])
-                        value = 60 + 35 * min(1.0, done / detected)
-                        self.progress.stop()
-                        self.progress.config(mode="determinate", maximum=100, value=value)
-                        self.progress_text.config(
-                            text=f"Replay live: Indra OCR {done}/{detected} lines - {parsed} damage events"
-                        )
-                    except Exception:
-                        pass
-                elif stage == "WAIT_OCR":
-                    self.progress_text.config(text="Replay live: waiting for OCR queue to finish ...")
+                if stage in ("FRAMES", "OCR", "WAIT_OCR") and len(parts) >= 5:
+                    self.set_replay_progress(stage, parts[2], parts[3], parts[4])
                 elif stage == "DONE":
-                    self.progress.stop()
-                    self.progress.config(mode="determinate", maximum=100, value=100)
-                    self.progress_text.config(text="Replay live test complete")
+                    self.set_replay_progress("DONE")
             elif line.startswith("REPLAY_ERROR|"):
                 self.progress_text.config(text=line.split("|", 1)[1])
         elif kind == "select":
@@ -3375,7 +3442,7 @@ class App(tk.Tk):
         self.stop_continuous_live()
         self.disable_controls()
         self.set_status("Replaying live pipeline ...", "#c98b16")
-        self.set_busy(True, f"Replay live test: {session.name} ...")
+        self.begin_replay_progress(session.name)
         cmd = [
             sys.executable, str(HERE / "replay_live_test.py"),
             "--session", str(session),

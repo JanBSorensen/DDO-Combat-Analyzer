@@ -137,6 +137,14 @@ def main():
     summary_path = session / "recording_summary.txt"
     config_copy = session / "config_used.json"
     config_copy.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    recorder_geometry_path = session / "recorder_capture_geometry.json"
+    recorder_geometry = {
+        "configured_capture": {key: int(cap[key]) for key in ("left", "top", "width", "height")},
+        "mss_capture_observed": False,
+        "observed_pixel_format": "gray",
+        "note": "Measurements from the independent FFV1 recorder MSS process",
+    }
+    recorder_geometry_path.write_text(json.dumps(recorder_geometry, indent=2), encoding="utf-8")
 
     width = int(cap["width"])
     height = int(cap["height"])
@@ -327,6 +335,21 @@ def main():
                     shot = sct.grab(cap)
                     bgra = np.asarray(shot, dtype=np.uint8)
                     gray = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
+                    if not recorder_geometry["mss_capture_observed"]:
+                        recorder_geometry.update({
+                            "mss_capture_observed": True,
+                            "actual_bgra_height": int(bgra.shape[0]),
+                            "actual_bgra_width": int(bgra.shape[1]),
+                            "actual_gray_height": int(gray.shape[0]),
+                            "actual_gray_width": int(gray.shape[1]),
+                            "first_capture_epoch": time.time(),
+                        })
+                        try:
+                            recorder_geometry_path.write_text(
+                                json.dumps(recorder_geometry, indent=2),
+                                encoding="utf-8")
+                        except Exception:
+                            pass
 
                     feature = text_feature(gray, feature_threshold, border)
                     change_ratio = feature_change_ratio(

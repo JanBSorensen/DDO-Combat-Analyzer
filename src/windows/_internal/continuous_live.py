@@ -17,6 +17,7 @@ import mss
 import tkinter as tk
 
 from live_overlay import LiveEstimator, make_clickthrough, is_ddo_foreground
+from live_input_diagnostics import LiveInputDiagnostics
 
 HERE = Path(__file__).resolve().parent
 CONFIG = HERE / 'config.json'
@@ -265,6 +266,21 @@ class ContinuousLiveEstimator(LiveEstimator):
         start_epoch = float(data['start_epoch'])
         self._set_session_boundary(start_epoch)
         with self.session_lock:
+            # A continuous live monitor starts before the first combat.
+            # Attach diagnostics to THIS recording only, preserving the
+            # exact live-MSS and Indra inputs until the session is flushed.
+            try:
+                self.capture_diagnostics = LiveInputDiagnostics(
+                    path, self.capture, start_epoch, self.start_epoch,
+                    self.indra_threads, self.ocr_batch_max,
+                    self.tracking_fps, indra_module=__import__('indra_ocr'))
+            except Exception as exc:
+                self.capture_diagnostics = None
+                try:
+                    (path / 'live_diagnostic_init_error.txt').write_text(
+                        str(exc), encoding='utf-8')
+                except Exception:
+                    pass
             self.session_path = path
             self.last_session_path = path
             self.session_start_epoch = start_epoch
@@ -313,6 +329,12 @@ class ContinuousLiveEstimator(LiveEstimator):
             self.session_stop_elapsed = stop_epoch - float(self.start_epoch)
             self.session_collecting = False
             stop_elapsed = self.session_stop_elapsed
+        diag = self.capture_diagnostics
+        if diag is not None:
+            try:
+                diag.mark_stop(stop_elapsed)
+            except Exception:
+                pass
         # If the newest combat row is still clipped when Stop is pressed, there
         # may never be a later scroll frame that exposes it fully. Queue that one
         # fragment now; its original capture timestamp remains before the stop
@@ -433,6 +455,25 @@ class ContinuousLiveEstimator(LiveEstimator):
                   stopped_epoch=stopped_epoch,
                   note=('Pre-stop OCR queue drained' if session_ocr_drained else
                         'Pre-stop OCR backlog remained after 5s; quick results may be incomplete'))
+        # Stop the bounded diagnostic capture only after pre-stop OCR has
+        # been drained. Its write errors cannot break the recording.
+        diag = self.capture_diagnostics
+        self.capture_diagnostics = None
+        if diag is not None:
+            try:
+                diag.finish({
+                    'session_ocr_drained': session_ocr_drained,
+                    'session_damage_events': len(event_rows),
+                    'session_ocr_rows': len(ocr_rows),
+                    'session_dropped_crops': dropped_during,
+                    'session_recording_seconds': recording_length,
+                })
+            except Exception as exc:
+                try:
+                    (path / 'live_diagnostic_finish_error.txt').write_text(
+                        str(exc), encoding='utf-8')
+                except Exception:
+                    pass
 
     def _record_session_sample(self, continuous_dps, continuous_apm, qdepth):
         with self.session_lock:
