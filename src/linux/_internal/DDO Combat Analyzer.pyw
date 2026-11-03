@@ -23,7 +23,28 @@ from tkinter import messagebox, ttk
 HERE = Path(__file__).resolve().parent
 CONFIG = HERE / "config.json"
 
+
+def read_performance_mode():
+    try:
+        return mode_from_config(json.loads(CONFIG.read_text(encoding='utf-8')))
+    except (ValueError, OSError):
+        return 'full'
+
+
+def save_performance_mode(mode):
+    if mode not in ('full', 'light'):
+        raise ValueError('Invalid performance mode')
+    cfg = json.loads(CONFIG.read_text(encoding='utf-8'))
+    cfg.setdefault('performance', {})['mode'] = mode
+    if mode == 'light':
+        cfg.setdefault('live_dps', {})['continuous_mode'] = True
+    temp = CONFIG.with_suffix('.json.tmp')
+    temp.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
+    temp.replace(CONFIG)
+
+
 from cpu_utils import physical_core_count, resolve_indra_threads
+from performance_mode import mode_from_config
 from update_manager import UpdateController, local_revision
 
 if sys.platform.startswith('linux'):
@@ -612,7 +633,7 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("DDO Combat Analyzer")
-        self.geometry("1020x805")
+        self.geometry("1020x835")
         self.minsize(900, 690)
 
         try:
@@ -631,7 +652,10 @@ class App(tk.Tk):
         self.current_session = None
         self.line_height_var = tk.StringVar(value=read_line_height_setting())
         live_settings = read_live_user_settings()
-        self.continuous_live_var = tk.BooleanVar(value=live_settings["continuous"])
+        self.performance_mode = read_performance_mode()
+        self.performance_mode_var = tk.StringVar(value='Light' if self.performance_mode == 'light' else 'Full')
+        self.continuous_live_var = tk.BooleanVar(value=(
+            True if self.performance_mode == 'light' else live_settings["continuous"]))
         self.hotkey_var = tk.StringVar(value=live_settings["hotkey"] if live_settings["hotkey"] in HOTKEY_CHOICES else "Pause/Break")
         self.overlay_position_var = tk.StringVar(value=OVERLAY_POSITION_LABELS.get(live_settings["position"], "Custom"))
         self.result_display_seconds = float(live_settings["result_seconds"])
@@ -657,6 +681,7 @@ class App(tk.Tk):
 
         self._build_style()
         self._build_ui()
+        self._apply_performance_controls()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.update_controller = UpdateController(self, self.update_button, HERE.parent)
 
@@ -879,6 +904,18 @@ class App(tk.Tk):
             ),
             style="Small.TLabel"
         ).pack(side="left")
+
+        # Both modes capture the complete configured Combat Log rectangle.
+        mode_row = ttk.Frame(control)
+        mode_row.pack(fill='x', pady=(9, 0))
+        ttk.Label(mode_row, text='Performance mode:').pack(side='left')
+        self.performance_combo = ttk.Combobox(
+            mode_row, textvariable=self.performance_mode_var,
+            values=('Full', 'Light'), width=8, state='readonly')
+        self.performance_combo.pack(side='left', padx=(6, 12))
+        self.performance_combo.bind('<<ComboboxSelected>>', self.on_performance_mode_changed)
+        self.performance_details = ttk.Label(mode_row, text='', style='Small.TLabel')
+        self.performance_details.pack(side='left', fill='x', expand=True)
 
         # Progress line
         prog = ttk.Frame(outer)
@@ -2363,7 +2400,7 @@ class App(tk.Tk):
         missing = []
         if st["missing_python"]:
             missing.append("Python packages")
-        if not st["ffmpeg"]:
+        if self.performance_mode == 'full' and not st["ffmpeg"]:
             missing.append("FFmpeg")
 
         if missing:
@@ -2378,7 +2415,8 @@ class App(tk.Tk):
             "Python packages: "
             + ("OK" if not st["missing_python"] else "Missing " + ", ".join(st["missing_python"]))
         )
-        lines.append("FFmpeg: " + (st["ffmpeg"] or "NOT FOUND"))
+        lines.append("FFmpeg: " + (st["ffmpeg"] or "NOT FOUND") +
+                     (" (not required in Light Mode)" if self.performance_mode == 'light' else ""))
 
         if st["missing_python"]:
             ans = messagebox.askyesno(
@@ -2725,8 +2763,8 @@ class App(tk.Tk):
                     self.launch_live_estimator()
                 self._beep(1250, 90)
                 self.stop_btn.config(state="normal")
-                self.set_status("Recording", "#b22222")
-                self.set_busy(False, "Recording - capture is active")
+                self.set_status('Recording (LIGHT)' if self.performance_mode == 'light' else 'Recording (FULL)', '#b22222')
+                self.set_busy(False, 'Light OCR capture active' if self.performance_mode == 'light' else 'FFV1 + live OCR capture active')
             elif line.startswith("FOCUS_PAUSED|"):
                 self.set_status("Recording paused - DDO not focused", "#c98b16")
                 self.progress_text.config(text="Capture paused while DDO is not the foreground window.")
@@ -2946,7 +2984,12 @@ class App(tk.Tk):
                 try:
                     _analysis_info = json.loads((self.current_session / 'analysis_summary.json').read_text(encoding='utf-8'))
                     _source = _analysis_info.get('analysis_source', '')
-                    if _source == 'live_ocr_fast':
+                    if _source == 'live_ocr_light':
+                        self.set_status('Light Mode: live OCR report complete', '#2e8b57')
+                        self.overview_note.config(text=(
+                            'Light Mode recorded no FFV1 video. This report is based only on live OCR; '
+                            'Reanalyze (FFV1) and Replay Live are unavailable. Saved OCR can be rebuilt.'))
+                    elif _source == 'live_ocr_fast':
                         self.set_status('Fast analysis (live OCR)', '#2e8b57')
                         self.overview_note.config(text=(
                             'Instant results from timestamped live OCR. Reanalyze (FFV1) '
@@ -3185,9 +3228,15 @@ class App(tk.Tk):
         if not hasattr(self, "reprocess_btn"):
             return
         selected = self.current_session or latest_session()
-        state = "normal" if self.proc is None and selected is not None else "disabled"
+        video_ok = bool(selected is not None and
+                        (Path(selected) / 'combat_changed_gray_ffv1.mkv').exists())
+        ocr_ok = bool(selected is not None and
+                      (Path(selected) / 'live_ocr_lines.csv').exists() and
+                      (Path(selected) / 'live_ocr_complete.json').exists())
+        state = 'normal' if self.proc is None and (video_ok or ocr_ok) else 'disabled'
         try:
-            self.reprocess_btn.config(state=state)
+            self.reprocess_btn.config(state=state, text=(
+                'Reanalyze (FFV1)' if video_ok else 'Rebuild from OCR'))
         except Exception:
             pass
         try:
@@ -3222,6 +3271,7 @@ class App(tk.Tk):
         self.overlay_position_combo.config(state="disabled")
         self.position_overlay_btn.config(state="disabled")
         self.continuous_check.config(state="disabled")
+        self.performance_combo.config(state='disabled')
 
     def enable_idle_controls(self):
         self.start_btn.config(state="normal")
@@ -3238,6 +3288,51 @@ class App(tk.Tk):
         self.overlay_position_combo.config(state="readonly")
         self.position_overlay_btn.config(state="normal")
         self.continuous_check.config(state="normal")
+        self.performance_combo.config(state='readonly')
+        self._apply_performance_controls()
+
+    def _apply_performance_controls(self):
+        light = self.performance_mode == 'light'
+        self.performance_details.config(text=(
+            '20 FPS | max 2 OCR threads | no FFV1 | minimal diagnostics | live-OCR report only'
+            if light else
+            '30 FPS (or configured) | usual OCR threads | lossless FFV1 + independent Reanalyze/Replay'))
+        if light:
+            self.continuous_live_var.set(True)
+            self.continuous_check.config(state='disabled')
+            self.ocr_threads_combo.config(state='disabled')
+        elif self.proc is None:
+            self.continuous_check.config(state='normal')
+            self.ocr_threads_combo.config(state='readonly')
+
+    def on_performance_mode_changed(self, _event=None):
+        if self.proc is not None:
+            self.performance_mode_var.set('Light' if self.performance_mode == 'light' else 'Full')
+            return
+        requested = self.performance_mode_var.get().lower()
+        if requested == self.performance_mode:
+            return
+        previous = self.performance_mode
+        try:
+            save_performance_mode(requested)
+            self.performance_mode = requested
+            if self.continuous_live_var.get():
+                self.stop_continuous_live()
+            if requested == 'light':
+                self.continuous_live_var.set(True)
+            self._apply_performance_controls()
+            self.refresh_system_status()
+            self.update_reprocess_button_state()
+            self.progress_text.config(text=(
+                'Light Mode selected: no FFV1 or Replay. Full Mode remains available.'
+                if requested == 'light' else 'Full Mode selected: FFV1 and reanalysis available.'))
+            if self.continuous_live_var.get():
+                self.after(250, self.ensure_continuous_live)
+        except Exception as exc:
+            self.performance_mode = previous
+            self.performance_mode_var.set('Light' if previous == 'light' else 'Full')
+            self._apply_performance_controls()
+            messagebox.showerror('Performance mode', str(exc))
 
     def on_line_height_changed(self, _event=None):
         if self.proc is not None:
@@ -3292,8 +3387,10 @@ class App(tk.Tk):
         problems = []
         if st["missing_python"]:
             problems.append("Python packages: " + ", ".join(st["missing_python"]))
-        if not st["ffmpeg"]:
+        if self.performance_mode == 'full' and not st["ffmpeg"]:
             problems.append("FFmpeg")
+        if self.performance_mode == 'light' and not self.continuous_live_var.get():
+            problems.append('Continuous live OCR must be enabled in Light Mode')
 
         if problems:
             messagebox.showerror(
@@ -3349,9 +3446,15 @@ class App(tk.Tk):
         self.set_status("Preparing recorder...", "#c98b16")
         self.set_busy(True, "Preparing recorder before switching to DDO ...")
 
-        # Start the recorder engine first. It sends RECORDER_READY only after
-        # FFmpeg and all output files are initialized. DDO is focused only then.
-        cmd = [sys.executable, str(HERE / "record_optimized.py")]
+        # Full records FFV1; Light only records a clock. Live OCR is sole capture.
+        if self.performance_mode == 'light' and (
+                self.live_proc is None or self.live_proc.poll() is not None):
+            self.set_busy(False, 'Live OCR failed to start')
+            self.enable_idle_controls()
+            messagebox.showerror('Light Mode', 'The Live OCR process did not start. Check the OCR installation.')
+            return
+        recorder = 'record_light.py' if self.performance_mode == 'light' else 'record_optimized.py'
+        cmd = [sys.executable, str(HERE / recorder)]
         self.start_subprocess(cmd, "record", stdin_pipe=True)
 
     def stop_recording(self, from_hotkey=False):
@@ -3379,7 +3482,7 @@ class App(tk.Tk):
         # Stay in the analyzer while the recording is finalized.
         # There is no reason to switch back to DDO after the user has pressed Stop.
 
-    def start_analysis(self, prefer_live=False):
+    def start_analysis(self, prefer_live=False, light_session=False):
         self.progress.stop()
         self.progress.config(mode="determinate", maximum=100, value=0)
         self.progress_text.config(text=(
@@ -3388,6 +3491,8 @@ class App(tk.Tk):
         ))
         cmd = [sys.executable, str(HERE / "process_latest.py"),
                "--prefer-live" if prefer_live else "--full-post"]
+        if prefer_live and (self.performance_mode == 'light' or light_session):
+            cmd.extend(['--light', '--live-wait', '45'])
         self.start_subprocess(cmd, "analyze", stdin_pipe=False)
 
     def reprocess_selected(self, session=None):
@@ -3397,16 +3502,18 @@ class App(tk.Tk):
         if session is None or not session.exists():
             messagebox.showinfo("Reanalysis", "There is no session selected to analyze.")
             return
-        if not (session / "combat_changed_gray_ffv1.mkv").exists():
+        video_available = (session / 'combat_changed_gray_ffv1.mkv').exists()
+        ocr_available = ((session / 'live_ocr_lines.csv').exists() and
+                         (session / 'live_ocr_complete.json').exists())
+        if not video_available and not ocr_available:
             messagebox.showerror(
-                "Reanalysis",
-                "The selected session does not contain the original capture video, so it cannot be reanalyzed."
-            )
+                'Reanalysis',
+                'This session has neither an FFV1 recording nor a completed live-OCR log.')
             return
 
         st = dependency_status()
-        if st["missing_python"] or not st["ffmpeg"]:
-            messagebox.showerror("System not ready", "Run System check first.")
+        if st['missing_python'] or (video_available and not st['ffmpeg']):
+            messagebox.showerror('System not ready', 'Run System check first.')
             return
 
         try:
@@ -3419,8 +3526,9 @@ class App(tk.Tk):
         self.analysis_background = False
         self.disable_controls()
         self.set_status("Analyzing ...", "#c98b16")
-        self.set_busy(True, f"Reanalyzing {session.name} ...")
-        self.start_analysis()
+        self.set_busy(True, f'Rebuilding {session.name} from OCR ...' if not video_available
+                      else f'Reanalyzing {session.name} ...')
+        self.start_analysis(prefer_live=not video_available, light_session=not video_available)
 
     def replay_live_selected(self, session=None):
         if self.proc is not None:

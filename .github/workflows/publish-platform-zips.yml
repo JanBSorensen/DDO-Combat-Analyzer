@@ -34,6 +34,11 @@ jobs:
               for p in [*internal.glob('*.py'), *internal.glob('*.pyw')]:
                   ast.parse(p.read_text(encoding='utf-8'), filename=str(p))
               assert (internal / 'update_manager.py').is_file()
+              assert (internal / 'performance_mode.py').is_file()
+              assert (internal / 'record_light.py').is_file()
+              assert "self.performance_combo" in (internal / 'DDO Combat Analyzer.pyw').read_text()
+              assert "--light" in (internal / 'process_latest.py').read_text()
+              assert "LiveResourceTracker" in (internal / 'continuous_live.py').read_text()
               assert 'UpdateController(' in (internal / 'DDO Combat Analyzer.pyw').read_text()
               assert 'self.version_label = ttk.Label' in (internal / 'DDO Combat Analyzer.pyw').read_text()
               print(platform, 'Python syntax and updater UI OK')
@@ -53,6 +58,8 @@ jobs:
             test -s "dist/staging/$platform/_internal/record_optimized.py"
             test -s "dist/staging/$platform/_internal/process_latest.py"
             test -s "dist/staging/$platform/_internal/update_manager.py"
+            test -s "dist/staging/$platform/_internal/performance_mode.py"
+            test -s "dist/staging/$platform/_internal/record_light.py"
             test -s "dist/staging/$platform/LICENSE"
             test ! -e "dist/staging/$platform/LOCAL_TEST_VERSION.txt"
           done
@@ -87,9 +94,10 @@ jobs:
           cat > dist/RELEASE_NOTES.md <<EOF
           DDO Combat Analyzer for Windows and Linux (X11).
 
-          - **New:** Opt-in update check at startup, with automatic installer, manual download and defer options. SHA-256 verified against the GitHub release metadata.
-          - **New:** Installed release version shown next to System status in the main window, read directly from VERSION.txt.
-          - **Improved:** Replay progress stability, early live/replay line tracking, damage-number and attack/critical parsing, and live OCR diagnostics.
+          - **New:** Full/Light selector in the same GUI on both platforms; Full retains lossless FFV1 video, independent post reanalysis and Replay Live.
+          - **Light:** 20-FPS OCR tracking, at most 2 OCR threads, no FFmpeg/video capture or redundant screenshot diagnostics. Saved live OCR supports rebuilding reports, not independent video reanalysis.
+          - **Unchanged:** Entire Combat Log selection, damage/attack/crit parsing, Live DPS/APM, overlay and updater. Full remains the default.
+          - **Added:** session-level resource and quality comparison summaries; CPU/RAM are measured for OCR helper only.
           - **Windows:** Download DDO-Combat-Analyzer-Windows.zip, extract it, run SETUP DDO Combat Analyzer.cmd once, then START DDO Combat Analyzer.cmd.
           - **Linux (Mint/Cinnamon X11):** Download DDO-Combat-Analyzer-Linux.zip, extract it, run bash 'SETUP DDO Combat Analyzer.sh' once, then ./START_DDO_COMBAT_ANALYZER.sh.
           - **Data safety:** Updating keeps existing config.json, capture area, OCR/Python installations and combat sessions.

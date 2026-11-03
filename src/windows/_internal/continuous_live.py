@@ -84,6 +84,7 @@ def overlay_xy(cfg, width, height, fallback_mon):
 
 
 from live_ocr_log import new_row, write_log, filter_session_to_stop
+from performance_mode import LiveResourceTracker
 
 class ContinuousLiveEstimator(LiveEstimator):
     """Persistent live OCR/DPS monitor.
@@ -120,7 +121,10 @@ class ContinuousLiveEstimator(LiveEstimator):
         self.session_live_samples = []
         self.session_ocr_rows = []
         # A short pre-session ring prevents lost OCR lines around START_SESSION.
-        self.ocr_recent_rows = deque(maxlen=20000)
+        self.ocr_recent_rows = deque(maxlen=1024 if self.performance_mode == 'light' else 20000)
+        self.session_resource_tracker = None
+        self.focus_pause_started_epoch = None
+        self.session_focus_intervals = []
         self.session_ocr_dropped_at_start = 0
         self.session_events = deque()  # (relative elapsed, amount)
         self.session_raw_total = 0
@@ -141,6 +145,19 @@ class ContinuousLiveEstimator(LiveEstimator):
         self.control_thread = None
         self.parent_pid = int(parent_pid) if parent_pid else None
         self.parent_watch_thread = None
+
+    def write_status(self, **updates):
+        if 'capture_paused_no_ddo_focus' not in updates:
+            return
+        epoch = time.time()
+        with self.session_lock:
+            if updates['capture_paused_no_ddo_focus']:
+                if self.focus_pause_started_epoch is None:
+                    self.focus_pause_started_epoch = epoch
+            elif self.focus_pause_started_epoch is not None:
+                if self.session_start_epoch is not None and self.session_path is not None:
+                    self.session_focus_intervals.append((self.focus_pause_started_epoch, epoch))
+                self.focus_pause_started_epoch = None
 
     def wait_for_clock(self):
         self.start_epoch = time.time()
@@ -269,18 +286,23 @@ class ContinuousLiveEstimator(LiveEstimator):
             # A continuous live monitor starts before the first combat.
             # Attach diagnostics to THIS recording only, preserving the
             # exact live-MSS and Indra inputs until the session is flushed.
-            try:
-                self.capture_diagnostics = LiveInputDiagnostics(
-                    path, self.capture, start_epoch, self.start_epoch,
-                    self.indra_threads, self.ocr_batch_max,
-                    self.tracking_fps, indra_module=__import__('indra_ocr'))
-            except Exception as exc:
+            if self.performance_mode == 'light':
                 self.capture_diagnostics = None
+            else:
                 try:
-                    (path / 'live_diagnostic_init_error.txt').write_text(
-                        str(exc), encoding='utf-8')
-                except Exception:
-                    pass
+                    self.capture_diagnostics = LiveInputDiagnostics(
+                        path, self.capture, start_epoch, self.start_epoch,
+                        self.indra_threads, self.ocr_batch_max,
+                        self.tracking_fps, indra_module=__import__('indra_ocr'))
+                except Exception as exc:
+                    self.capture_diagnostics = None
+                    try:
+                        (path / 'live_diagnostic_init_error.txt').write_text(
+                            str(exc), encoding='utf-8')
+                    except Exception:
+                        pass
+            self.session_resource_tracker = LiveResourceTracker()
+            self.session_focus_intervals = []
             self.session_path = path
             self.last_session_path = path
             self.session_start_epoch = start_epoch
@@ -395,6 +417,9 @@ class ContinuousLiveEstimator(LiveEstimator):
             dropped_during = max(0, self.dropped_lines_total - self.session_ocr_dropped_at_start)
             started_epoch = self.session_start_epoch
             stopped_epoch = self.start_epoch + self.session_stop_elapsed if self.session_stop_elapsed is not None else None
+            focus_windows = list(self.session_focus_intervals)
+            if self.focus_pause_started_epoch is not None and stopped_epoch is not None:
+                focus_windows.append((self.focus_pause_started_epoch, stopped_epoch))
             start_tracking = dict(self.session_snapshot)
             tracker_counts = {
                 key: max(0, int(getattr(self, key, 0)) - int(start_tracking.get(key, 0)))
@@ -419,8 +444,36 @@ class ContinuousLiveEstimator(LiveEstimator):
             })
 
         path.mkdir(parents=True, exist_ok=True)
+        if self.performance_mode == 'light':
+            focus_rows = []
+            for began, ended in focus_windows:
+                start = max(float(began), float(started_epoch or began))
+                finish = min(float(ended), float(stopped_epoch or ended))
+                if finish > start:
+                    focus_rows.append((start - float(started_epoch or start),
+                                       finish - float(started_epoch or start), finish - start))
+            with (path / 'focus_interruptions.csv').open('w', newline='', encoding='utf-8') as stream:
+                writer = csv.writer(stream)
+                writer.writerow(['start_elapsed_seconds', 'end_elapsed_seconds',
+                                 'duration_seconds', 'resume_saved_frame'])
+                for a, b, duration in focus_rows:
+                    writer.writerow([f'{a:.6f}', f'{b:.6f}', f'{duration:.6f}', ''])
+            tracker_counts['focus_interruptions'] = len(focus_rows)
+            tracker_counts['focus_interruption_seconds'] = round(sum(r[2] for r in focus_rows), 4)
         (path / 'live_tracking_quality.json').write_text(
             json.dumps(tracker_counts, indent=2), encoding='utf-8')
+        if self.session_resource_tracker is not None:
+            try:
+                metrics = self.session_resource_tracker.finish(
+                    mode=self.performance_mode,
+                    fps=self.tracking_fps, threads=self.indra_threads,
+                    dropped_crops=dropped_during, ocr_rows=len(ocr_rows),
+                    drained=session_ocr_drained)
+                (path / 'live_resource_usage.json').write_text(
+                    json.dumps(metrics, indent=2), encoding='utf-8')
+            except Exception:
+                pass
+            self.session_resource_tracker = None
         event_path = path / 'live_damage_events.csv'
         with event_path.open('w', newline='', encoding='utf-8') as f:
             w = csv.writer(f)
@@ -435,6 +488,8 @@ class ContinuousLiveEstimator(LiveEstimator):
                 row = list(row)
                 row[1] = f'{float(row[1]):.6f}'
                 row[2] = f'{float(row[2]):.6f}'
+                if self.performance_mode == 'light':
+                    row[11] = ''
                 w.writerow(row)
 
         live_path = path / 'live_dps.csv'
@@ -477,6 +532,8 @@ class ContinuousLiveEstimator(LiveEstimator):
 
     def _record_session_sample(self, continuous_dps, continuous_apm, qdepth):
         with self.session_lock:
+            if self.session_resource_tracker is not None:
+                self.session_resource_tracker.sample()
             if self.session_path is None or self.session_start_elapsed is None:
                 return
             now_cont = time.time() - float(self.start_epoch)

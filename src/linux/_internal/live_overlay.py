@@ -30,6 +30,7 @@ CONFIG = HERE / "config.json"
 DEFAULT_LIVE_WINDOW_SECONDS = 15.0
 
 from cpu_utils import resolve_indra_threads
+from performance_mode import mode_from_config, scan_rate, ocr_threads
 from live_ocr_log import new_row, write_log
 from live_input_diagnostics import LiveInputDiagnostics
 from focus_resume_guard import recover_append_rows
@@ -831,13 +832,14 @@ class LiveEstimator:
         self.cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
         self.capture = self.cfg["capture"]
         self.live_cfg = self.cfg.get("live_dps", {})
+        self.performance_mode = mode_from_config(self.cfg)
         self.analysis_cfg = self.cfg.get("analysis", {})
 
         self.window_seconds = max(1.0, float(self.live_cfg.get('rolling_window_seconds', DEFAULT_LIVE_WINDOW_SECONDS)))
         # Retain enough recent events to allow the user to increase the rolling
         # window while continuous live mode is already running.
         self.history_seconds = max(60.0, self.window_seconds)
-        self.tracking_fps = max(10, int(self.live_cfg.get("tracking_fps", self.cfg.get("capture_fps", 30))))
+        self.tracking_fps = scan_rate(self.cfg)
         self.tracking_interval = 1.0 / self.tracking_fps
         self.line_height = max(8, int(self.analysis_cfg.get("line_height", 16)))
         self.auto_line_height = bool(self.analysis_cfg.get("auto_line_height", True))
@@ -858,7 +860,7 @@ class LiveEstimator:
         self.ocr_engine_preference = str(self.live_cfg.get("ocr_engine", "indra")).strip().lower()
         self.ocr_batch_max = max(1, min(32, int(self.live_cfg.get("ocr_batch_max_lines", 12))))
         self.indra_threads_setting = self.live_cfg.get("indra_threads", "auto")
-        self.indra_threads = resolve_indra_threads(self.indra_threads_setting)
+        self.indra_threads = ocr_threads(self.cfg, resolve_indra_threads)
         self.indra_converter = None
         self.ocr_engine_active = "starting"
 
@@ -1483,7 +1485,7 @@ class LiveEstimator:
             tracking_worker_started=True,
             tracking_worker_finished=False,
             tracking_fps_target=self.tracking_fps,
-            architecture="30fps visual tracking + asynchronous batched Indra OCR",
+            architecture=f"{self.tracking_fps}fps visual tracking + asynchronous batched Indra OCR ({self.performance_mode})",
         )
 
         if not self.wait_for_clock():

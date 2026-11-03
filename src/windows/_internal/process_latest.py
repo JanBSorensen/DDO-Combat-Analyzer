@@ -26,6 +26,7 @@ from post_numeric_guard import NumericGuard
 from attack_mode_audit import save as save_attack_audit
 from focus_resume_guard import recover_append_rows
 from live_ocr_log import read_log
+from performance_mode import comparison_summary, mode_from_config
 from live_post_diagnostics import reconcile
 
 
@@ -33,19 +34,21 @@ from live_post_diagnostics import reconcile
 # Session / executable discovery
 # ---------------------------------------------------------------------------
 
-def locate_session():
+def locate_session(allow_live=False):
+    def eligible(folder):
+        return ((folder / 'combat_changed_gray_ffv1.mkv').exists() or
+                (allow_live and (folder / 'config_used.json').exists()))
     pointer = HERE / "LATEST_SESSION.txt"
     if pointer.exists():
         try:
             p = Path(pointer.read_text(encoding="utf-8").strip())
-            if p.exists() and (p / "combat_changed_gray_ffv1.mkv").exists():
+            if p.exists() and eligible(p):
                 return p
         except Exception:
             pass
-
     sessions = [
         p for p in HERE.glob("combat_*")
-        if p.is_dir() and (p / "combat_changed_gray_ffv1.mkv").exists()
+        if p.is_dir() and eligible(p)
     ]
     return max(sessions, key=lambda p: p.stat().st_mtime) if sessions else None
 
@@ -3369,6 +3372,10 @@ def main():
     total_seconds = time.perf_counter() - total_t0
     timing_details["TOTAL"] = f"session={session.name}"
     write_post_analysis_timings(session, timings, total_seconds, timing_details)
+    try:
+        comparison_summary(session)
+    except (OSError, ValueError):
+        pass
 
     print("PROGRESS|DONE|1|1", flush=True)
     print("Analysis complete.", flush=True)
@@ -3424,7 +3431,9 @@ def _fast_live_analysis(session, log_rows, log_metadata):
     outgoing, incoming, healing, corrections, suspicious = parse_combat_events(
         messages, message_times, message_lines, resolver=guard.resolve)
     guard.save(session / 'post_numeric_validation.csv')
-    shutil.copy2(session / 'post_numeric_validation.csv', session / 'fast_live_numeric_validation.csv')
+    is_light = mode_from_config(json.loads((session / 'config_used.json').read_text(encoding='utf-8'))) == 'light'
+    if not is_light:
+        shutil.copy2(session / 'post_numeric_validation.csv', session / 'fast_live_numeric_validation.csv')
     print('PROGRESS|OCR|1|1', flush=True)
     logical, logical_times, logical_lines = reassemble_wrapped_combat_messages(texts, times)
     attacks, confirms = parse_attack_crit_events(logical, logical_times, logical_lines)
@@ -3432,34 +3441,45 @@ def _fast_live_analysis(session, log_rows, log_metadata):
     print('PROGRESS|PARSE|1|1', flush=True)
     create_reports(session, texts, outgoing, incoming, healing, attacks, confirms,
                    defensive_misses, corrections, suspicious, 0, len(texts))
-    shutil.copy2(session / 'damage_events.csv', session / 'fast_live_damage_events.csv')
-    save_attack_audit(session, 'fast_live', attacks, confirms)
+    if not is_light:
+        shutil.copy2(session / 'damage_events.csv', session / 'fast_live_damage_events.csv')
+        save_attack_audit(session, 'fast_live', attacks, confirms)
     report_path = session / 'COMBAT_REPORT.txt'
-    report_path.write_text(
-        'FAST RESULTS FROM LIVE OCR - NOT INDEPENDENT FFV1 POST ANALYSIS\n'
-        'Use Reanalyze (FFV1) in the GUI for the separate video-based result.\n\n'
-        + report_path.read_text(encoding='utf-8'), encoding='utf-8')
-    shutil.copy2(report_path, session / 'fast_live_COMBAT_REPORT.txt')
+    if is_light:
+        header = ('LIGHT MODE: LIVE OCR ONLY - NO FFV1 VIDEO WAS RECORDED\n'
+                  'Independent video reanalysis and replay are unavailable.\n\n')
+    else:
+        header = ('FAST RESULTS FROM LIVE OCR - NOT INDEPENDENT FFV1 POST ANALYSIS\n'
+                  'Use Reanalyze (FFV1) in the GUI for the separate video-based result.\n\n')
+    report_path.write_text(header + report_path.read_text(encoding='utf-8'), encoding='utf-8')
+    if not is_light:
+        shutil.copy2(report_path, session / 'fast_live_COMBAT_REPORT.txt')
     summary_path = session / 'analysis_summary.json'
     summary = json.loads(summary_path.read_text(encoding='utf-8'))
-    summary['analysis_source'] = 'live_ocr_fast'
+    summary['analysis_source'] = 'live_ocr_light' if is_light else 'live_ocr_fast'
+    summary['recording_mode'] = 'light' if is_light else 'full'
     summary['data_quality']['numeric_validation'] = guard.stats
     summary['data_quality']['wrapped_damage_rows'] = wrap_stats
     summary['data_quality']['live_ocr_complete'] = log_metadata.get('capture_ocr_complete')
     summary['data_quality']['live_ocr_dropped_crops'] = log_metadata.get('dropped_line_crops')
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
-    shutil.copy2(summary_path, session / 'fast_live_analysis_summary.json')
-    reconcile(session, source='live_ocr_fast', wrap_stats=wrap_stats, guard_stats=guard.stats)
+    if not is_light:
+        shutil.copy2(summary_path, session / 'fast_live_analysis_summary.json')
+        reconcile(session, source='live_ocr_fast', wrap_stats=wrap_stats, guard_stats=guard.stats)
     elapsed = time.perf_counter() - t0
     write_post_analysis_timings(session, [('fast_live_ocr_read_parse_reports',elapsed)],elapsed,
         {'fast_live_ocr_read_parse_reports':'FFV1 decode, visual reconstruction, and post Indra OCR skipped',
          'TOTAL':'fast analysis from timestamped live OCR'})
+    try:
+        comparison_summary(session)
+    except (OSError, ValueError):
+        pass
     print('PROGRESS|DONE|1|1', flush=True)
-    print('Fast analysis complete (source: live OCR, not FFV1 post).', flush=True)
+    print(f'Fast analysis complete (mode: {"LIGHT" if is_light else "FULL"}; source: live OCR).', flush=True)
 
 
-def prefer_live_main(wait_seconds=7.0):
-    session = locate_session()
+def prefer_live_main(wait_seconds=7.0, require_live=False):
+    session = locate_session(allow_live=True)
     if session is None:
         raise SystemExit('No recorded session found.')
     deadline = time.monotonic() + max(0.0, float(wait_seconds))
@@ -3469,6 +3489,8 @@ def prefer_live_main(wait_seconds=7.0):
             _fast_live_analysis(session, rows, meta)
             return
         if time.monotonic() >= deadline:
+            if require_live or not (session / 'combat_changed_gray_ffv1.mkv').exists():
+                raise SystemExit('Light OCR did not finish in time. No video fallback exists.')
             print('Live OCR log not ready; automatically falling back to FFV1 post-analysis.',flush=True)
             main()
             return
@@ -3483,8 +3505,10 @@ if __name__ == "__main__":
     parser.add_argument('--full-post', action='store_true',
                         help='Force independent FFV1 reconstruction and Indra OCR')
     parser.add_argument('--live-wait', type=float, default=7.0)
+    parser.add_argument('--light', action='store_true',
+                        help='Video-free Light Mode: require finished live OCR, never FFV1 fallback')
     args = parser.parse_args()
     if args.prefer_live and not args.full_post:
-        prefer_live_main(args.live_wait)
+        prefer_live_main(args.live_wait, require_live=args.light)
     else:
         main()

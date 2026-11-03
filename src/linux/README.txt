@@ -189,3 +189,18 @@ LiveScrollFix / StopCritFix parity with Windows:
 - Correct critical confirmation message prefixes
 Linux remains native X11 (Mint 22.3), not Wayland.
 Review tests before using on a long session.
+
+
+PERFORMANCE MODE: FULL OR LIGHT (ONE APPLICATION)
+------------------------------------------------
+Full is default and retains lossless FFV1 video, independent reanalysis,
+Replay Live and configured OCR settings.
+
+Light runs 20-FPS live tracking with at most two Indra threads. It uses
+the live helper as the only screen reader: no FFmpeg video or redundant
+per-row screenshot diagnostics. The entire Combat Log selection and
+damage, sneak, attack/critical parsing are unchanged. Light saves OCR
+evidence for "Rebuild from OCR", but no independent video replay.
+
+Both modes save performance_comparison.json and live_resource_usage.json.
+CPU/RAM data are for the OCR helper, not for DDO or the entire computer.

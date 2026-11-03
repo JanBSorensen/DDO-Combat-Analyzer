@@ -21,6 +21,22 @@ See the [GitHub Releases page](https://github.com/JanBSorensen/DDO-Combat-Analyz
 - **Architecture summary:** `docs/ARCHITECTURE.md`
 - **Troubleshooting:** `docs/TROUBLESHOOTING.md`
 
+## Full and Light modes
+
+Choose **Full** (default) or **Light** from the Recording panel on Windows or
+Linux Mint/Cinnamon X11. Both modes use the same selected Combat Log width
+and the same Indra damage, attack, critical-hit and sneak-attack parsing.
+
+- **Full:** 30-FPS (or configured) tracking, normal OCR threads, lossless FFV1
+  video, independent post reanalysis and Replay Live.
+- **Light:** 20-FPS live tracking, maximum 2 OCR threads, no independent
+  FFmpeg/video capture, no redundant per-row screenshot diagnostics. Live
+  OCR results are saved and can be rebuilt, but cannot be independently
+  replayed or reanalyzed from video.
+
+Each session includes a comparable performance summary; CPU/RAM data only
+cover the live OCR helper, not DDO, GUI, FFmpeg or the entire computer.
+
 ## Main functions
 
 - Select a Combat Log capture area.
