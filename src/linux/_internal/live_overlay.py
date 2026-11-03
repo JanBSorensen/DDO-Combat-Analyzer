@@ -34,6 +34,8 @@ from performance_mode import mode_from_config, scan_rate, ocr_threads
 from live_ocr_log import new_row, write_log
 from live_input_diagnostics import LiveInputDiagnostics
 from focus_resume_guard import recover_append_rows
+from capture_geometry import rectangle
+from combat_log_visibility import CombatLogVisibilityGuard
 
 if sys.platform.startswith("linux"):
     from linux_x11 import (
@@ -612,6 +614,28 @@ def estimate_shift_linewise_live(prev_gray, curr_gray, prev_phase, curr_phase, l
     )
     return shift_lines * line_height, best_score, second_score, confident
 
+def recovery_shift_from_previous(prev_feat, current_feat, prev_phase, current_phase,
+                                 line_height, max_shift_px):
+    """Safely recover a completed scroll missed by an obsolete sticky anchor.
+
+    This operates on the *immediately previous* image, not the old anchor. A
+    shift is accepted only if the existing strict fast matcher positively
+    identifies a whole-row scroll. This is important: merely rebasing after
+    a timeout loses lines; guessing a shift duplicates damage.
+    """
+    if prev_feat is None or prev_phase is None or current_feat is None:
+        return 0, 'unavailable'
+    shift, _error, _zero, decision = estimate_shift_fast(
+        prev_feat, current_feat, line_height, max_shift_px,
+        phase_offset=(int(prev_phase) - int(current_phase)) % max(1, int(line_height)),
+    )
+    if int(shift) >= int(line_height) and decision in (
+        'positive', 'phase-corrected-positive'
+    ):
+        return int(shift), decision
+    return 0, decision
+
+
 def line_cells(gray, phase, line_height):
     h = gray.shape[0]
     cells = []
@@ -927,6 +951,18 @@ class LiveEstimator:
         self.anchor_linewise_overrides = 0
         self.phase_corrected_scrolls = 0
         self.anchor_phase_timeout_rebases = 0
+        self.anchor_previous_frame_checks = 0
+        self.anchor_previous_frame_recoveries = 0
+        self.anchor_hold_streak_max = 0
+        self.anchor_stall_warnings = 0
+        self.anchor_unresolved_gaps = 0
+        # The live process remains alive while the user edits config.json.
+        # Track and apply capture-rectangle changes on its capture thread, not
+        # only during construction (the 2026-11-03 21:55 regression).
+        self.capture_reload_requested = threading.Event()
+        self.capture_applied_event = threading.Event()
+        self.capture_applied_event.set()
+        self.capture_refreshes = 0
 
         self.root = None
         self.overlay_canvas = None
@@ -935,6 +971,14 @@ class LiveEstimator:
         self.detail_item = None
 
     def write_status(self, **updates):
+        return
+
+    def on_capture_geometry(self, region, bgra, gray):
+        """Subclass hook: record actual MSS dimensions for active sessions."""
+        return
+
+    def on_log_visibility_transition(self, event, elapsed, details):
+        """Optional, low-frequency event hook; never write per-frame debug images."""
         return
 
     def wait_for_clock(self):
@@ -1568,6 +1612,7 @@ class LiveEstimator:
             pre_focus_phase = None
             pre_focus_line_height = None
             focus_resume_pending = False
+            visibility_guard = CombatLogVisibilityGuard(resume_frames=3)
 
             baseline_path = self.session / "baseline_gray.png"
             if baseline_path.exists():
@@ -1607,10 +1652,49 @@ class LiveEstimator:
             }
 
             capture_paused_for_focus = False
+            next_capture_config_check = 0.0
             with mss.MSS() as sct:
                 while not self.stop_event.is_set():
                     if self.stop_path.exists():
                         break
+
+                    # Re-read geometry while idle as well as while DDO has
+                    # focus. An already-running live helper must not retain
+                    # coordinates from before the user selected a new area.
+                    config_clock = time.monotonic()
+                    if (self.capture_reload_requested.is_set() or
+                            config_clock >= next_capture_config_check):
+                        self.capture_reload_requested.clear()
+                        next_capture_config_check = config_clock + 0.5
+                        try:
+                            new_region = rectangle(json.loads(
+                                CONFIG.read_text(encoding='utf-8'))['capture'])
+                        except (ValueError, OSError, KeyError, TypeError):
+                            new_region = region
+                        if new_region != region:
+                            # Recorder config_used.json is immutable for the
+                            # current session. Do not drift to another area
+                            # mid-recording; report the attempted change.
+                            active = getattr(self, 'session_collecting', False)
+                            if active:
+                                self.write_status(capture_change_during_session=True)
+                            else:
+                                self.capture_applied_event.clear()
+                                region = dict(new_region)
+                                self.capture = dict(new_region)
+                                self.capture_refreshes += 1
+                                prev_gray = prev_feat = prev_phase = None
+                                last_phase = None
+                                align_gray = align_feat = align_phase = None
+                                align_age_frames = 0
+                                focus_resume_pending = False
+                                visibility_guard.reset_for_geometry_change()
+                                self.clear_pending_bottom_line(count_drop=True)
+                                self.line_height_candidates = []
+                                if self.auto_line_height:
+                                    self.line_height_locked = False
+                                self.write_status(capture_region_reloaded=region)
+                        self.capture_applied_event.set()
 
                     now = time.perf_counter()
                     if now < next_deadline:
@@ -1686,6 +1770,11 @@ class LiveEstimator:
                     shot = sct.grab(region)
                     bgra = np.asarray(shot, dtype=np.uint8)
                     gray = cv2.cvtColor(bgra, cv2.COLOR_BGRA2GRAY)
+                    try:
+                        self.on_capture_geometry(region, bgra, gray)
+                    except Exception:
+                        # Diagnostic I/O must not break the FPS-sensitive path.
+                        pass
                     diag = self.capture_diagnostics
                     if diag is not None:
                         # This is the real live MSS grab, before visual
@@ -1696,6 +1785,69 @@ class LiveEstimator:
                             pass
                     feat = fast_text_feature(gray)
                     self.tracking_frames += 1
+                    visibility = visibility_guard.inspect(gray)
+                    if visibility.transition:
+                        self.on_log_visibility_transition(
+                            visibility.transition, elapsed, {
+                                'reason': visibility.reason,
+                                'dark_fraction': round(visibility.dark_fraction, 5),
+                                'ink_fraction': round(visibility.ink_fraction, 5),
+                                'left_ink_fraction': round(visibility.left_ink_fraction, 5),
+                                'midtone_fraction': round(visibility.midtone_fraction, 5),
+                                'scene_change': round(visibility.scene_change, 5),
+                                'blocked_frames': visibility_guard.blocked_frames,
+                            },
+                        )
+                        self.write_status(
+                            combat_log_hidden=(visibility.transition == 'hidden'),
+                            combat_log_visibility_reason=visibility.reason,
+                        )
+
+                    if visibility.action != 'track':
+                        # Loading screens, fades and the first confirmed RETURN
+                        # frame must NEVER be compared to the old chat anchor.
+                        # In particular, the return frame contains OLD text:
+                        # feeding it through append/scroll OCR counts it twice.
+                        prev_gray = prev_feat = prev_phase = None
+                        last_phase = None
+                        align_gray = align_feat = align_phase = None
+                        align_age_frames = 0
+                        focus_resume_pending = False
+                        pre_focus_feat = pre_focus_phase = pre_focus_line_height = None
+                        self.clear_pending_bottom_line(count_drop=True)
+                        if visibility.action == 'rebaseline':
+                            phase = best_grid_phase_from_feature(feat, self.line_height)
+                            prev_gray, prev_feat, prev_phase = gray, feat, phase
+                            align_gray, align_feat, align_phase = gray, feat, phase
+                            last_phase = phase
+
+                        # Keep sampling even while zoning. This is essential:
+                        # a >15 s no-damage interval must decay to zero DPS.
+                        track_w.writerow([
+                            self.tracking_frames, f'{elapsed:.6f}', 0, 0,
+                            '', '', f'visibility-{visibility.action}:{visibility.reason}',
+                            '', '', '', 0, 'visibility-guard',
+                            '', '', '', '', '', '', False, False,
+                            self.ocr_queue.qsize(), f'{lateness * 1000.0:.2f}',
+                        ])
+                        now2 = time.perf_counter()
+                        if now2 >= next_live_sample:
+                            live_dps, window_damage, live_apm, window_attacks = self.current_metrics(elapsed)
+                            live_w.writerow([
+                                f'{elapsed:.6f}', f'{wall_epoch:.6f}', f'{live_dps:.3f}',
+                                f'{self.window_seconds:g}', window_damage, self.parsed_events_total,
+                                self.detected_lines_total, self.ocr_lines_total,
+                                self.ocr_queue.qsize(), self.dropped_lines_total,
+                                f'{live_apm:.3f}', window_attacks, self.parsed_attacks_total,
+                            ])
+                            live_f.flush()
+                            self.update_queue.put((
+                                'metrics', live_dps, live_apm, window_damage,
+                                window_attacks, self.parsed_events_total,
+                                self.parsed_attacks_total, self.ocr_queue.qsize(),
+                            ))
+                            next_live_sample = now2 + 0.20
+                        continue
 
                     # Auto-detect chat line spacing. While unlocked, collect only
                     # high-confidence measurements. Once three agree, lock it for
@@ -1842,6 +1994,23 @@ class LiveEstimator:
                             elif lw_confident:
                                 decision += "+linewise-zero"
 
+                        # The old sticky anchor can become unmatchable once the
+                        # log has changed too much. In the November reference
+                        # recording it held for 53 saved frames although two
+                        # consecutive frames had a clear +126 px scroll.
+                        # Recheck the immediately preceding image, and accept
+                        # ONLY a confidently positive, completed-row shift.
+                        if shift == 0 and align_age_frames >= 1 and prev_feat is not None:
+                            self.anchor_previous_frame_checks += 1
+                            pair_shift, pair_decision = recovery_shift_from_previous(
+                                prev_feat, feat, prev_phase, phase,
+                                self.line_height, self.max_shift_px,
+                            )
+                            if pair_shift > 0:
+                                shift = pair_shift
+                                decision += '+prev-frame-positive'
+                                self.anchor_previous_frame_recoveries += 1
+
                         crop_entries = []  # (elapsed, crop)
                         recovered = self.recover_pending_bottom_line(gray, feat, shift)
                         if recovered is not None:
@@ -1910,8 +2079,17 @@ class LiveEstimator:
                         else:
                             align_age_frames += 1
                             self.anchor_hold_frames_total += 1
+                            self.anchor_hold_streak_max = max(
+                                self.anchor_hold_streak_max, align_age_frames)
                             anchor_action = "hold"
                             decision += "+anchor-hold"
+                            # A changed image with no detected rows is not
+                            # proof of zero damage. Surface this as a quality
+                            # warning; never invent damage from a guessed shift.
+                            if align_age_frames == 8 and zero > self.anchor_zero_rebase_error:
+                                self.anchor_stall_warnings += 1
+                                decision += '+possible-scroll-gap'
+                                self.write_status(anchor_stall_warning=True)
                             # Safety valve only after a long unresolved period and
                             # only when the row grid has returned to the anchor
                             # phase. This avoids a permanently stale reference but
@@ -1926,12 +2104,13 @@ class LiveEstimator:
                                 if phase_delta > 1:
                                     self.anchor_phase_timeout_rebases += 1
                                     decision += "+phase-timeout"
+                                self.anchor_unresolved_gaps += 1
                                 align_gray = gray
                                 align_feat = feat
                                 align_phase = phase
                                 align_age_frames = 0
                                 anchor_action = "timeout-rebase"
-                                decision += "+anchor-timeout-rebase"
+                                decision += "+anchor-timeout-rebase+unresolved-gap"
 
                     track_w.writerow([
                         self.tracking_frames,
@@ -2015,6 +2194,9 @@ class LiveEstimator:
                             robust_fallback_overrides=self.robust_fallback_overrides,
                             phase_corrected_scrolls=self.phase_corrected_scrolls,
                             anchor_phase_timeout_rebases=self.anchor_phase_timeout_rebases,
+                            anchor_previous_frame_recoveries=self.anchor_previous_frame_recoveries,
+                            anchor_stall_warnings=self.anchor_stall_warnings,
+                            anchor_unresolved_gaps=self.anchor_unresolved_gaps,
                         )
                         next_status = now2 + 1.0
 

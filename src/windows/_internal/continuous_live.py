@@ -85,6 +85,7 @@ def overlay_xy(cfg, width, height, fallback_mon):
 
 from live_ocr_log import new_row, write_log, filter_session_to_stop
 from performance_mode import LiveResourceTracker
+from capture_geometry import rectangle, session_rectangle, write_comparison
 
 class ContinuousLiveEstimator(LiveEstimator):
     """Persistent live OCR/DPS monitor.
@@ -145,8 +146,82 @@ class ContinuousLiveEstimator(LiveEstimator):
         self.control_thread = None
         self.parent_pid = int(parent_pid) if parent_pid else None
         self.parent_watch_thread = None
+        self.session_geometry_written_for = None
+        self.session_geometry_observed = None
+        self.session_capture_invalid = False
+        self.capture_change_during_session = False
+        self.zone_log_hidden = False
+        self.zone_hidden_count = 0
+        self.zone_resume_count = 0
+        # A bounded metadata-only file remains available even when no
+        # session is being recorded (the original zoning bug occurs idle).
+        self.zone_event_path = HERE / 'live_zone_diagnostics.jsonl'
+        self.zone_event_lock = threading.Lock()
+        self.zone_recent_events = deque(maxlen=256)
+
+    def on_log_visibility_transition(self, event, elapsed, details):
+        epoch = time.time()
+        self.zone_log_hidden = event == 'hidden'
+        if event == 'hidden':
+            self.zone_hidden_count += 1
+        elif event == 'resumed':
+            self.zone_resume_count += 1
+        dps, window_damage, _apm, _attacks = self.current_metrics(elapsed)
+        row = {
+            'utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(epoch)),
+            'wall_epoch': round(epoch, 6),
+            'elapsed_seconds': round(float(elapsed), 6),
+            'event': str(event),
+            'reason': str(details.get('reason', '')),
+            'dark_fraction': details.get('dark_fraction', ''),
+            'ink_fraction': details.get('ink_fraction', ''),
+            'left_ink_fraction': details.get('left_ink_fraction', ''),
+            'midtone_fraction': details.get('midtone_fraction', ''),
+            'scene_change': details.get('scene_change', ''),
+            'rolling_dps': round(dps, 3),
+            'rolling_damage': int(window_damage),
+            'parsed_damage_events_total': int(self.parsed_events_total),
+            'recording': bool(self.session_collecting),
+        }
+        with self.zone_event_lock:
+            self.zone_recent_events.append(row)
+            try:
+                # Rotate at 256 KiB so an always-on live helper does not
+                # accumulate an unlimited idle-session log.
+                if self.zone_event_path.exists() and self.zone_event_path.stat().st_size > 256 * 1024:
+                    self.zone_event_path.replace(HERE / 'live_zone_diagnostics.previous.jsonl')
+                with self.zone_event_path.open('a', encoding='utf-8') as f:
+                    f.write(json.dumps(row, ensure_ascii=False) + '\n')
+            except OSError:
+                # Disk access must not stop capture or live DPS.
+                pass
+
+    def on_capture_geometry(self, region, bgra, gray):
+        with self.session_lock:
+            path = self.session_path
+            if path is None or self.session_geometry_written_for == path:
+                return
+            expected = session_rectangle(path)
+            observed = {
+                'actual_live_capture': rectangle(region),
+                'actual_bgra_width': int(bgra.shape[1]),
+                'actual_bgra_height': int(bgra.shape[0]),
+                'actual_gray_width': int(gray.shape[1]),
+                'actual_gray_height': int(gray.shape[0]),
+                'first_capture_epoch': time.time(),
+            }
+            (path / 'live_capture_geometry.json').write_text(
+                json.dumps(observed, indent=2), encoding='utf-8')
+            comparison = write_comparison(
+                path, expected, region, (gray.shape[1], gray.shape[0]),
+                stage='first_live_mss_grab')
+            self.session_capture_invalid = not comparison['match']
+            self.session_geometry_observed = observed
+            self.session_geometry_written_for = path
 
     def write_status(self, **updates):
+        if updates.get('capture_change_during_session'):
+            self.capture_change_during_session = True
         if 'capture_paused_no_ddo_focus' not in updates:
             return
         epoch = time.time()
@@ -267,6 +342,31 @@ class ContinuousLiveEstimator(LiveEstimator):
             except queue.Full:
                 self.dropped_lines_total += 1
 
+    def _preflight_capture(self, path_text):
+        """Confirm live geometry BEFORE the independent recorder receives START."""
+        path = Path(path_text).resolve()
+        try:
+            expected = session_rectangle(path)
+            self.capture_applied_event.clear()
+            self.capture_reload_requested.set()
+            reloaded = self.capture_applied_event.wait(timeout=5.0)
+            actual = rectangle(self.capture)
+            result = write_comparison(path, expected, actual, stage='recorder_ready_preflight')
+            result['ready'] = bool(reloaded and result['match'])
+            if not reloaded:
+                result['error'] = 'Live capture thread did not acknowledge geometry reload.'
+            elif not result['match']:
+                result['error'] = 'Live and recorder use different Combat Log areas.'
+        except Exception as exc:
+            result = {'ready': False, 'error': f'{type(exc).__name__}: {exc}'}
+        try:
+            target = path / 'live_capture_preflight.json'
+            tmp = target.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps(result, indent=2), encoding='utf-8')
+            tmp.replace(target)
+        except Exception:
+            pass
+
     def _start_session(self, path_text):
         path = Path(path_text).resolve()
         clock = path / 'recording_clock.json'
@@ -281,6 +381,31 @@ class ContinuousLiveEstimator(LiveEstimator):
         if not data:
             return
         start_epoch = float(data['start_epoch'])
+        try:
+            expected = session_rectangle(path)
+        except Exception as exc:
+            (path / 'live_capture_geometry_error.txt').write_text(
+                'No valid recorder capture geometry: ' + str(exc), encoding='utf-8')
+            return
+        if rectangle(self.capture) != expected:
+            # The capture loop owns its MSS region. Ask it to reload and wait
+            # for the new coordinates; changing self.capture here would NOT
+            # change its local rectangle and would silently fake a match.
+            self.capture_applied_event.clear()
+            self.capture_reload_requested.set()
+            self.capture_applied_event.wait(timeout=2.0)
+        if rectangle(self.capture) != expected:
+            write_comparison(path, expected, self.capture, stage='start_session_rejected')
+            (path / 'live_capture_geometry_error.txt').write_text(
+                'Live capture differs from the recorder; refused to attach live '
+                'data. Select the log area again or restart the app.', encoding='utf-8')
+            self.session_capture_invalid = True
+            return
+        write_comparison(path, expected, self.capture, stage='start_session_config_check')
+        self.session_geometry_written_for = None
+        self.session_geometry_observed = None
+        self.session_capture_invalid = False
+        self.capture_change_during_session = False
         self._set_session_boundary(start_epoch)
         with self.session_lock:
             # A continuous live monitor starts before the first combat.
@@ -338,6 +463,14 @@ class ContinuousLiveEstimator(LiveEstimator):
                 'anchor_phase_timeout_rebases': self.anchor_phase_timeout_rebases,
                 'robust_fallback_overrides': self.robust_fallback_overrides,
                 'anchor_linewise_overrides': self.anchor_linewise_overrides,
+                'anchor_previous_frame_checks': self.anchor_previous_frame_checks,
+                'anchor_previous_frame_recoveries': self.anchor_previous_frame_recoveries,
+                'anchor_stall_warnings': self.anchor_stall_warnings,
+                'anchor_unresolved_gaps': self.anchor_unresolved_gaps,
+                'anchor_hold_streak_max': self.anchor_hold_streak_max,
+                'capture_refreshes': self.capture_refreshes,
+                'zone_hidden_count': self.zone_hidden_count,
+                'zone_resume_count': self.zone_resume_count,
             }
 
     def _stop_session(self, stop_epoch_text=''):
@@ -418,6 +551,12 @@ class ContinuousLiveEstimator(LiveEstimator):
             started_epoch = self.session_start_epoch
             stopped_epoch = self.start_epoch + self.session_stop_elapsed if self.session_stop_elapsed is not None else None
             focus_windows = list(self.session_focus_intervals)
+            with self.zone_event_lock:
+                # Preserve some context before START_SESSION as well. The
+                # ongoing idle log remains in _internal even after Stop.
+                zone_events = [dict(row) for row in self.zone_recent_events
+                               if float(row['wall_epoch']) >= float(started_epoch or 0) - 30.0
+                               and float(row['wall_epoch']) <= float(stopped_epoch or time.time())]
             if self.focus_pause_started_epoch is not None and stopped_epoch is not None:
                 focus_windows.append((self.focus_pause_started_epoch, stopped_epoch))
             start_tracking = dict(self.session_snapshot)
@@ -425,8 +564,18 @@ class ContinuousLiveEstimator(LiveEstimator):
                 key: max(0, int(getattr(self, key, 0)) - int(start_tracking.get(key, 0)))
                 for key in ('tracking_frames', 'phase_corrected_scrolls',
                             'anchor_phase_timeout_rebases', 'robust_fallback_overrides',
-                            'anchor_linewise_overrides')
+                            'anchor_linewise_overrides', 'anchor_previous_frame_checks',
+                            'anchor_previous_frame_recoveries', 'anchor_stall_warnings',
+                            'anchor_unresolved_gaps', 'capture_refreshes',
+                            'zone_hidden_count', 'zone_resume_count')
             }
+            tracker_counts['anchor_hold_streak_max'] = int(self.anchor_hold_streak_max)
+            tracker_counts['capture_change_during_session'] = bool(self.capture_change_during_session)
+            tracker_counts['capture_geometry_valid'] = not bool(self.session_capture_invalid)
+            if not self.session_geometry_observed:
+                tracker_counts['capture_geometry_verified_by_mss'] = False
+            else:
+                tracker_counts['capture_geometry_verified_by_mss'] = True
             recording_length = max(0.0, (stopped_epoch or 0.0) - (started_epoch or 0.0))
             last_ocr = max((float(r.get('capture_elapsed_seconds', 0.0)) for r in ocr_rows),
                            default=None)
@@ -460,6 +609,18 @@ class ContinuousLiveEstimator(LiveEstimator):
                     writer.writerow([f'{a:.6f}', f'{b:.6f}', f'{duration:.6f}', ''])
             tracker_counts['focus_interruptions'] = len(focus_rows)
             tracker_counts['focus_interruption_seconds'] = round(sum(r[2] for r in focus_rows), 4)
+        # Small metadata-only diagnostics, shipped in the session ZIP when a
+        # session is recorded across zoning; no image/text capture required.
+        with (path / 'live_zone_events.csv').open('w', newline='', encoding='utf-8') as file:
+            columns = ['utc', 'wall_epoch', 'elapsed_seconds', 'event', 'reason',
+                       'dark_fraction', 'ink_fraction', 'left_ink_fraction',
+                       'midtone_fraction', 'scene_change', 'rolling_dps',
+                       'rolling_damage', 'parsed_damage_events_total', 'recording']
+            writer = csv.DictWriter(file, fieldnames=columns, extrasaction='ignore')
+            writer.writeheader()
+            writer.writerows(zone_events)
+        tracker_counts['zone_visibility_events_saved'] = len(zone_events)
+        tracker_counts['zone_log_hidden_at_flush'] = bool(self.zone_log_hidden)
         (path / 'live_tracking_quality.json').write_text(
             json.dumps(tracker_counts, indent=2), encoding='utf-8')
         if self.session_resource_tracker is not None:
@@ -646,6 +807,8 @@ class ContinuousLiveEstimator(LiveEstimator):
                     continue
                 if line.startswith('SESSION_BOUNDARY|'):
                     self._set_session_boundary(line.split('|', 1)[1])
+                elif line.startswith('PREPARE_CAPTURE|'):
+                    self._preflight_capture(line.split('|', 1)[1])
                 elif line.startswith('START_SESSION|'):
                     self._start_session(line.split('|', 1)[1])
                 elif line.startswith('STOP_SESSION'):
@@ -667,6 +830,7 @@ class ContinuousLiveEstimator(LiveEstimator):
                     except Exception:
                         pass
                 elif line == 'RELOAD_CONFIG':
+                    self.capture_reload_requested.set()
                     self.update_queue.put(('reload_config',))
                 elif line == 'SHUTDOWN':
                     self.stop_event.set()
@@ -754,7 +918,8 @@ class ContinuousLiveEstimator(LiveEstimator):
                         self.overlay_canvas.itemconfigure(self.apm_item, text=f'{int(round(apm))} APM')
                         self.overlay_canvas.itemconfigure(
                             self.detail_item,
-                            text=f'LIVE {self.window_seconds:g}s  |  HEJSA  |  queue {qdepth}')
+                            text=(f'LIVE {self.window_seconds:g}s  |  HEJSA  |  '
+                                  f'{"LOG HIDDEN" if self.zone_log_hidden else f"queue {qdepth}"}'))
                 elif kind == 'reload_config':
                     self._reload_config_and_position()
                 elif kind == 'done':

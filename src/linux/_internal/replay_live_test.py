@@ -14,6 +14,7 @@ from live_ocr_log import COLUMNS as OCR_COLUMNS
 from three_mode_compare import generate as generate_three_mode_comparison
 from attack_mode_audit import save_from_replay_ocr
 from focus_resume_guard import recover_append_rows
+from combat_log_visibility import CombatLogVisibilityGuard
 from pathlib import Path
 
 import cv2
@@ -29,6 +30,7 @@ from live_overlay import (
     estimate_shift_linewise_live,
     estimate_shift_robust_live,
     fast_text_feature,
+    recovery_shift_from_previous,
 )
 
 
@@ -332,6 +334,10 @@ def run_replay(session: Path):
     pre_focus_phase = None
     pre_focus_line_height = None
     focus_resume_pending = False
+    # FFV1 stores changed frames only: one stable return frame is enough to
+    # safely REBASELINE; the next saved frame may be a new damage event.
+    visibility_guard = CombatLogVisibilityGuard(resume_frames=1)
+    visibility_events = []
     baseline = session / "baseline_gray.png"
     if baseline.exists():
         prev_gray = cv2.imread(str(baseline), cv2.IMREAD_GRAYSCALE)
@@ -413,6 +419,38 @@ def run_replay(session: Path):
 
             feat = fast_text_feature(gray)
             est.tracking_frames += 1
+            visibility = visibility_guard.inspect(gray)
+            if visibility.transition:
+                visibility_events.append({
+                    'saved_frame': saved_frame,
+                    'elapsed_seconds': f'{elapsed:.6f}',
+                    'event': visibility.transition,
+                    'reason': visibility.reason,
+                    'dark_fraction': f'{visibility.dark_fraction:.5f}',
+                    'ink_fraction': f'{visibility.ink_fraction:.5f}',
+                    'scene_change': f'{visibility.scene_change:.5f}',
+                })
+            if visibility.action != 'track':
+                # Never treat old Combat Log returning from a loading screen
+                # as a newly scrolled/appended message.
+                prev_gray = prev_feat = prev_phase = None
+                align_gray = align_feat = align_phase = None
+                align_age_frames = 0
+                focus_resume_pending = False
+                pre_focus_feat = pre_focus_phase = pre_focus_line_height = None
+                est.clear_pending_bottom_line(count_drop=True)
+                if visibility.action == 'rebaseline':
+                    phase = best_grid_phase_from_feature(feat, est.line_height)
+                    prev_gray, prev_feat, prev_phase = gray, feat, phase
+                    align_gray, align_feat, align_phase = gray, feat, phase
+                track_w.writerow([
+                    saved_frame, entry['capture_frame'], f'{elapsed:.6f}', 0, 0,
+                    '', '', f'visibility-{visibility.action}:{visibility.reason}',
+                    '', '', '', 0, 'visibility-guard',
+                    '', '', '', False, '', '', '', False, False,
+                    est.ocr_queue.qsize(),
+                ])
+                continue
 
             if est.auto_line_height and not est.line_height_locked:
                 detected_h, _lh_score, _lh_margin, lh_ok = detect_line_height_from_gray(
@@ -527,6 +565,17 @@ def run_replay(session: Path):
                     elif lw_confident:
                         decision += "+linewise-zero"
 
+                if shift == 0 and align_age_frames >= 1 and prev_feat is not None:
+                    est.anchor_previous_frame_checks += 1
+                    pair_shift, pair_decision = recovery_shift_from_previous(
+                        prev_feat, feat, prev_phase, phase,
+                        est.line_height, est.max_shift_px,
+                    )
+                    if pair_shift > 0:
+                        shift = pair_shift
+                        decision += '+prev-frame-positive'
+                        est.anchor_previous_frame_recoveries += 1
+
                 crop_entries = []
                 recovered = est.recover_pending_bottom_line(gray, feat, shift)
                 if recovered is not None:
@@ -586,18 +635,23 @@ def run_replay(session: Path):
                 else:
                     align_age_frames += 1
                     est.anchor_hold_frames_total += 1
+                    est.anchor_hold_streak_max = max(est.anchor_hold_streak_max, align_age_frames)
                     anchor_action = "hold"
                     decision += "+anchor-hold"
+                    if align_age_frames == 8 and zero > est.anchor_zero_rebase_error:
+                        est.anchor_stall_warnings += 1
+                        decision += '+possible-scroll-gap'
                     if align_age_frames >= est.anchor_timeout_frames:
                         if phase_delta > 1:
                             est.anchor_phase_timeout_rebases += 1
                             decision += "+phase-timeout"
+                        est.anchor_unresolved_gaps += 1
                         align_gray = gray
                         align_feat = feat
                         align_phase = phase
                         align_age_frames = 0
                         anchor_action = "timeout-rebase"
-                        decision += "+anchor-timeout-rebase"
+                        decision += "+anchor-timeout-rebase+unresolved-gap"
 
             track_w.writerow([
                 saved_frame,
@@ -666,6 +720,17 @@ def run_replay(session: Path):
         if ocr_thread.is_alive():
             ocr_thread.join(timeout=2.0)
 
+    # This stays useful even if the replay is run after the real recording.
+    with (session / 'replay_live_visibility_events.csv').open(
+        'w', newline='', encoding='utf-8'
+    ) as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            'saved_frame', 'elapsed_seconds', 'event', 'reason',
+            'dark_fraction', 'ink_fraction', 'scene_change',
+        ])
+        writer.writeheader()
+        writer.writerows(visibility_events)
+
     duration = float(rows[-1]["elapsed"])
     write_replay_dps(est, duration)
     # Independent attack/confirmation records from the replay's own OCR rows.
@@ -708,6 +773,14 @@ def run_replay(session: Path):
         "anchor_hold_frames": int(est.anchor_hold_frames_total),
         "anchor_linewise_runs": int(est.anchor_linewise_runs),
         "anchor_linewise_overrides": int(est.anchor_linewise_overrides),
+        "anchor_previous_frame_checks": int(est.anchor_previous_frame_checks),
+        "anchor_previous_frame_recoveries": int(est.anchor_previous_frame_recoveries),
+        "anchor_hold_streak_max": int(est.anchor_hold_streak_max),
+        "anchor_stall_warnings": int(est.anchor_stall_warnings),
+        "anchor_unresolved_gaps": int(est.anchor_unresolved_gaps),
+        "zone_visibility_hidden_transitions": visibility_guard.transitions_to_hidden,
+        "zone_visibility_resumed_transitions": visibility_guard.transitions_to_visible,
+        "zone_visibility_blocked_saved_frames": visibility_guard.blocked_frames,
         "line_height_used": int(est.line_height),
         "indra_threads": int(est.indra_threads),
         "ocr_batch_max_lines": int(est.ocr_batch_max),

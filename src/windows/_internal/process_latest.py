@@ -25,6 +25,7 @@ from cpu_utils import physical_core_count, resolve_indra_threads
 from post_numeric_guard import NumericGuard
 from attack_mode_audit import save as save_attack_audit
 from focus_resume_guard import recover_append_rows
+from combat_log_visibility import CombatLogVisibilityGuard
 from live_ocr_log import read_log
 from performance_mode import comparison_summary, mode_from_config
 from live_post_diagnostics import reconcile
@@ -2848,6 +2849,10 @@ def main():
     prev_gray = None
     prev_phase = None
     baseline_used = False
+    # Only saved changed frames are decoded; a single confirmed return frame
+    # can safely REBASELINE without OCR of old displayed Combat Log rows.
+    visibility_guard = CombatLogVisibilityGuard(resume_frames=1)
+    visibility_events = []
     baseline_path = session / "baseline_gray.png"
     if baseline_path.exists():
         try:
@@ -2858,6 +2863,7 @@ def main():
                 prev_feat = text_feature(bgray)
                 prev_phase = best_grid_phase(bgray, line_height, feat=prev_feat)
                 baseline_used = True
+                visibility_guard.inspect(bgray)  # original pre-recording chat
         except Exception:
             baseline_used = False
             prev_feat = None
@@ -2897,6 +2903,37 @@ def main():
         gray = np.frombuffer(data, dtype=np.uint8).reshape((height, width)).copy()
         feat = text_feature(gray)
         recon_profile["frame_preprocessing"] += time.perf_counter() - _t
+
+        visibility = visibility_guard.inspect(gray)
+        if visibility.transition:
+            visibility_events.append({
+                'saved_frame': frame_no,
+                'elapsed_seconds': saved_frame_times.get(frame_no, ''),
+                'event': visibility.transition,
+                'reason': visibility.reason,
+                'dark_fraction': f'{visibility.dark_fraction:.5f}',
+                'ink_fraction': f'{visibility.ink_fraction:.5f}',
+                'scene_change': f'{visibility.scene_change:.5f}',
+            })
+        if visibility.action != 'track':
+            # Never interpret a loading screen OR an old Combat Log returning
+            # from zoning as new damage. The return is a new visual baseline.
+            if pending_bottom_line is not None:
+                dropped_bottom_count += 1
+                pending_bottom_line = None
+            prev_gray = prev_feat = prev_phase = None
+            last_phase = None
+            if visibility.action == 'rebaseline':
+                phase = best_grid_phase(gray, line_height, feat=feat)
+                prev_gray, prev_feat, prev_phase = gray, feat, phase
+                last_phase = phase
+            align_w.writerow([
+                frame_no, 0, 0, '', '',
+                'visibility-' + visibility.action + ':' + visibility.reason,
+                '' if last_phase is None else last_phase,
+                False, '', '', False, '', '', '',
+            ])
+            continue
 
         if frame_no in focus_resume_frames:
             # A pending clipped row cannot be tracked safely across a focus
@@ -3171,6 +3208,16 @@ def main():
                         enc.tofile(str(line_dir / f"{eof_idx + 1:06d}.png"))
                 recon_profile["line_png_encode_write"] += time.perf_counter() - _t
         pending_bottom_line = None
+
+    with (session / 'post_zone_visibility_events.csv').open(
+        'w', newline='', encoding='utf-8'
+    ) as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            'saved_frame', 'elapsed_seconds', 'event', 'reason',
+            'dark_fraction', 'ink_fraction', 'scene_change',
+        ])
+        writer.writeheader()
+        writer.writerows(visibility_events)
 
     proc.stdout.close()
     stderr = proc.stderr.read().decode("utf-8", errors="replace")

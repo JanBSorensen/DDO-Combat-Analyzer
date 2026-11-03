@@ -2718,7 +2718,12 @@ class App(tk.Tk):
         if kind == "record":
             if line.startswith("SESSION_DIR|"):
                 self.recording_session = Path(line.split("|", 1)[1].strip())
+                if self.continuous_live_var.get():
+                    self.ensure_continuous_live()
+                    self.send_live_command('RELOAD_CONFIG')
+                    self.send_live_command(f'PREPARE_CAPTURE|{self.recording_session}')
             elif line == "RECORDER_READY":
+                self._capture_preflight_deadline = time.monotonic() + 15.0
                 if self.recording_started_by_hotkey:
                     self.progress_text.config(text="Recorder ready - starting in background...")
                     self.after(10, self.begin_capture_after_focus)
@@ -2728,6 +2733,7 @@ class App(tk.Tk):
                     focus_ddo()
                     self.after(35, self.begin_capture_after_focus)
             elif line == "CAPTURE_STARTED":
+                self._record_capture_started = True
                 if self.continuous_live_var.get():
                     self.ensure_continuous_live()
                     if self.recording_live_boundary_epoch is not None:
@@ -2857,6 +2863,42 @@ class App(tk.Tk):
     def begin_capture_after_focus(self):
         if self.proc is None or self.proc_kind != "record":
             return
+        if self.continuous_live_var.get():
+            # The recorder is blocked on its START handshake until the live
+            # helper has confirmed the identical screen-coordinate rectangle.
+            preflight = ((self.recording_session / 'live_capture_preflight.json')
+                         if self.recording_session is not None else None)
+            data = None
+            try:
+                if preflight and preflight.exists():
+                    data = json.loads(preflight.read_text(encoding='utf-8'))
+            except Exception:
+                data = None
+            if data is None and time.monotonic() < getattr(
+                    self, '_capture_preflight_deadline', 0):
+                self.after(100, self.begin_capture_after_focus)
+                return
+            if not data or not data.get('ready', False):
+                error_text = (data or {}).get(
+                    'error', 'Live helper did not acknowledge capture geometry.')
+                self.recording_cancelled_by_preflight = True
+                try:
+                    if self.proc.stdin:
+                        self.proc.stdin.write('CANCEL\n')
+                        self.proc.stdin.flush()
+                except Exception:
+                    pass
+                self._beep(500, 180)
+                self.set_status('Capture geometry check failed', '#b22222')
+                self.set_busy(False, 'Recorder was cancelled; no combat was recorded.')
+                self.after(100, self.bring_to_front)
+                messagebox.showerror(
+                    'Combat Log area mismatch',
+                    'Recording was cancelled before START, because the live '
+                    'and video capture areas could not be confirmed identical.\n\n'
+                    + str(error_text),
+                )
+                return
         try:
             if self.proc.stdin:
                 self.proc.stdin.write("START\n")
@@ -2924,6 +2966,15 @@ class App(tk.Tk):
 
         elif kind == "record":
             self.stop_timer()
+            if getattr(self, 'recording_cancelled_by_preflight', False):
+                # The recorder may return zero after a pre-START CANCEL. This
+                # is NOT a finished combat session, and analysis must not run.
+                self.recording_cancelled_by_preflight = False
+                self.bring_to_front()
+                self.set_busy(False, 'Recorder cancelled before capture started.')
+                self.set_status('Capture geometry check failed', '#b22222')
+                self.enable_idle_controls()
+                return
             if self.continuous_live_var.get():
                 self.send_live_command("FLUSH_SESSION")
             else:
@@ -3036,6 +3087,9 @@ class App(tk.Tk):
                     bottom_deferred = data.get("bottom_deferred")
                     bottom_recovered = data.get("bottom_recovered")
                     bottom_flush = data.get("bottom_stop_flushed")
+                    previous_frame_recoveries = data.get('anchor_previous_frame_recoveries', 0)
+                    stall_warnings = data.get('anchor_stall_warnings', 0)
+                    unresolved = data.get('anchor_unresolved_gaps', 0)
                     lines = [
                         "Offline live replay complete.",
                         "",
@@ -3050,6 +3104,8 @@ class App(tk.Tk):
                         f"Detected / OCR lines: {detected} / {ocr_lines}",
                         f"Robust alignment fallbacks: {fallback} (overrides: {overrides})",
                         f"Bottom rows: deferred {bottom_deferred}, recovered {bottom_recovered}, Stop-flushed {bottom_flush}",
+                        f"Stale anchor recovered: {previous_frame_recoveries} times; "
+                        f"stall warnings: {stall_warnings}; unresolved gaps: {unresolved}",
                         "",
                         "This replay checks live reconstruction/OCR/parser correctness on the saved capture. "
                         "It is not a real-time throughput test; the offline OCR queue waits instead of dropping lines.",
@@ -3406,10 +3462,16 @@ class App(tk.Tk):
         ):
             return
 
+        self.recording_cancelled_by_preflight = False
+        self._record_capture_started = False
         self.recording_started_by_hotkey = bool(from_hotkey)
         self.analysis_background = bool(from_hotkey)
         self.recording_live_boundary_epoch = time.time()
         self.ensure_continuous_live()
+        # The recorder snapshots config_used.json at startup. Refresh the
+        # already-running live helper before starting it, so it doesn't keep
+        # an older Combat Log rectangle from a previous selection.
+        self.send_live_command('RELOAD_CONFIG')
         # Drop only OCR work that was detected before this recording boundary.
         # Already-confirmed rolling events are deliberately preserved so live DPS
         # remains truly continuous across recording start/stop.
@@ -3434,6 +3496,17 @@ class App(tk.Tk):
 
     def stop_recording(self, from_hotkey=False):
         if self.proc is None or self.proc_kind != "record":
+            return
+        if not getattr(self, '_record_capture_started', False):
+            # Do not turn a pre-START stop/cancel into an empty successful
+            # recording; the recorder treats any non-START input as cancel.
+            self.recording_cancelled_by_preflight = True
+            try:
+                if self.proc.stdin:
+                    self.proc.stdin.write('CANCEL\n')
+                    self.proc.stdin.flush()
+            except Exception:
+                pass
             return
 
         if from_hotkey:
