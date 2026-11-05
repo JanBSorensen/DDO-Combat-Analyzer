@@ -2,3 +2,4 @@ mss
 opencv-python
 numpy
 indra-ocr
+psutil>=5.9

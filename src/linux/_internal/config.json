@@ -64,6 +64,6 @@
     "first_run_guide_shown": false
   },
   "performance": {
-    "mode": "full"
+    "mode": "light"
   }
 }

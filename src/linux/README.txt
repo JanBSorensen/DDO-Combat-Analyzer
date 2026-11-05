@@ -86,7 +86,7 @@ The validated reference area is about 885 x 522 px. A selection below 70% of tha
 width OR height is allowed, but the program warns because clipped or too-few rows
 can reduce OCR/reconstruction reliability.
 
-A dark opaque Combat Log background gives the most reliable OCR.
+A SOLID OPAQUE BLACK Combat Log background is required. A live quality check warns if the visible background appears nonblack.
 
 LIVE RECONSTRUCTION
 -------------------
@@ -193,7 +193,7 @@ Review tests before using on a long session.
 
 PERFORMANCE MODE: FULL OR LIGHT (ONE APPLICATION)
 ------------------------------------------------
-Full is default and retains lossless FFV1 video, independent reanalysis,
+Light is default for new installs. Full retains lossless FFV1 video, independent reanalysis,
 Replay Live and configured OCR settings.
 
 Light runs 20-FPS live tracking with at most two Indra threads. It uses
@@ -204,3 +204,12 @@ evidence for "Rebuild from OCR", but no independent video replay.
 
 Both modes save performance_comparison.json and live_resource_usage.json.
 CPU/RAM data are for the OCR helper, not for DDO or the entire computer.
+
+NOVEMBER 2026 QUALITY UPDATE
+----------------------------
+Light is the new installation default (20 FPS, at most two Indra threads);
+existing Full/Light preferences are preserved on update.
+Wrapped damage/sneak messages (up to four lines), numeric B/8 OCR and
+parse coverage diagnostics are improved. A live solid-black-background
+check warns without blocking recording. Full FFV1 reanalysis/replay
+also warns about nonblack backgrounds. Linux remains native X11.

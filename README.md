@@ -23,7 +23,7 @@ See the [GitHub Releases page](https://github.com/JanBSorensen/DDO-Combat-Analyz
 
 ## Full and Light modes
 
-Choose **Full** (default) or **Light** from the Recording panel on Windows or
+Choose **Light** (default) or **Full** from the Recording panel on Windows or
 Linux Mint/Cinnamon X11. Both modes use the same selected Combat Log width
 and the same Indra damage, attack, critical-hit and sneak-attack parsing.
 
@@ -93,3 +93,8 @@ FFmpeg's license depends on the executable build used.
 ## Disclaimer
 
 This is an independent community project and is not affiliated with or endorsed by Standing Stone Games.
+
+
+### November 2026: Light default and quality safeguards
+
+Light mode is now the default for new Windows and Linux installations (20 FPS, up to 2 OCR threads). Full remains available for FFV1 video, independent Reanalyze and Replay Live; existing mode preferences are preserved. An **opaque black DDO Combat Log background is required** for reliable OCR. The analyzer warns about nonblack backgrounds and improves wrapped damage/sneak attack parsing, B/8 numeric OCR verification and event coverage diagnostics.

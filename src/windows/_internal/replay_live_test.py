@@ -15,6 +15,7 @@ from three_mode_compare import generate as generate_three_mode_comparison
 from attack_mode_audit import save_from_replay_ocr
 from focus_resume_guard import recover_append_rows
 from combat_log_visibility import CombatLogVisibilityGuard
+from combat_log_background import inspect_saved_background, save_background_report, BackgroundMonitor, WARNING_TEXT
 from pathlib import Path
 
 import cv2
@@ -297,6 +298,10 @@ def write_replay_dps(est: ReplayLiveEstimator, duration: float):
 
 
 def run_replay(session: Path):
+    background_report = inspect_saved_background(session)
+    save_background_report(session, background_report, filename='replay_background_check.json')
+    if background_report['status'] == 'warning':
+        print('WARNING|COMBAT_LOG_BACKGROUND_NOT_BLACK|' + background_report['warning'], flush=True)
     video = session / "combat_changed_gray_ffv1.mkv"
     if not video.exists():
         raise RuntimeError("The selected session has no combat_changed_gray_ffv1.mkv capture.")
@@ -338,6 +343,7 @@ def run_replay(session: Path):
     # safely REBASELINE; the next saved frame may be a new damage event.
     visibility_guard = CombatLogVisibilityGuard(resume_frames=1)
     visibility_events = []
+    background_monitor = BackgroundMonitor(sample_seconds=2.0, confirm_samples=3)
     baseline = session / "baseline_gray.png"
     if baseline.exists():
         prev_gray = cv2.imread(str(baseline), cv2.IMREAD_GRAYSCALE)
@@ -417,6 +423,7 @@ def run_replay(session: Path):
                 align_age_frames = 0
                 est.clear_pending_bottom_line(count_drop=True)
 
+            background_monitor.inspect(gray, now=elapsed)
             feat = fast_text_feature(gray)
             est.tracking_frames += 1
             visibility = visibility_guard.inspect(gray)
@@ -746,6 +753,12 @@ def run_replay(session: Path):
     if post_total not in (None, 0):
         difference_pct = difference / float(post_total) * 100.0
 
+    background_report['full_video_periodic_scan'] = background_monitor.as_dict()
+    if background_monitor.ever_warned:
+        background_report['status'] = 'warning'
+        background_report['warning'] = WARNING_TEXT
+        background_report['warning_in_full_video'] = True
+    save_background_report(session, background_report, filename='replay_background_check.json')
     summary = {
         "mode": "offline_live_pipeline_replay",
         "session": session.name,
@@ -781,6 +794,8 @@ def run_replay(session: Path):
         "zone_visibility_hidden_transitions": visibility_guard.transitions_to_hidden,
         "zone_visibility_resumed_transitions": visibility_guard.transitions_to_visible,
         "zone_visibility_blocked_saved_frames": visibility_guard.blocked_frames,
+        "combat_log_background": background_report,
+        "warning_nonblack_background": background_report['warning'],
         "line_height_used": int(est.line_height),
         "indra_threads": int(est.indra_threads),
         "ocr_batch_max_lines": int(est.ocr_batch_max),

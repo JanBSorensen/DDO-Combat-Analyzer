@@ -32,24 +32,32 @@ RECORDING & ANALYSIS
 
 NOTES
 Keep DDO's Combat Log visible and in the foreground during recording.
-A dark, opaque Combat Log background helps recognition. A focus interruption
+A SOLID OPAQUE BLACK Combat Log background is REQUIRED for reliable capture.
+The live background monitor warns when the visible background looks nonblack.
+A focus interruption
 may cause some lines to be lost if the log scrolls while the game is unfocused.
 The analyzer is non-invasive: it reads screenshots rather than game memory.
 
 Source: https://github.com/JanBSorensen/DDO-Combat-Analyzer
 License and third-party notices are supplied in LICENSE and THIRD_PARTY_NOTICES.md.
 
+PERFORMANCE MODES
+=================
+Light is the default for NEW installations: 20-FPS OCR tracking, at most
+two OCR threads, no FFV1 video; a report can be rebuilt from saved OCR.
+Full saves FFV1 video for independent Reanalyze and Replay Live.
+Switch between modes from the application GUI. Updating does not replace
+an existing user's config.json or explicit Full/Light selection.
 
-PERFORMANCE MODE: FULL OR LIGHT (ONE APPLICATION)
-------------------------------------------------
-Full is default and retains lossless FFV1 video, independent reanalysis,
-Replay Live and configured OCR settings.
-
-Light runs 20-FPS live tracking with at most two Indra threads. It uses
-the live helper as the only screen reader: no FFmpeg video or redundant
-per-row screenshot diagnostics. The entire Combat Log selection and
-damage, sneak, attack/critical parsing are unchanged. Light saves OCR
-evidence for "Rebuild from OCR", but no independent video replay.
-
-Both modes save performance_comparison.json and live_resource_usage.json.
-CPU/RAM data are for the OCR helper, not for DDO or the entire computer.
+QUALITY / FIXES (NOV 2026)
+==========================
+- Wrapped Combat Log messages (including sneak attacks) are reconstructed,
+  up to four rows, with source coverage diagnostics.
+- Suspicious numeric OCR values receive a targeted verification rather than
+  blind correction.
+- An opaque black Combat Log background is REQUIRED. The live monitor checks
+  approximately every 2 seconds. Full reanalysis and replay warn if the saved
+  background is not black (recording is not forcibly blocked).
+- CPU/RAM session monitoring includes analyzer GUI/helper processes but
+  excludes the DDO game.
+- The advanced post-analysis, damage report and UI are retained.

@@ -28,7 +28,7 @@ def read_performance_mode():
     try:
         return mode_from_config(json.loads(CONFIG.read_text(encoding='utf-8')))
     except (ValueError, OSError):
-        return 'full'
+        return 'light'
 
 
 def save_performance_mode(mode):
@@ -45,6 +45,7 @@ def save_performance_mode(mode):
 
 from cpu_utils import physical_core_count, resolve_indra_threads
 from performance_mode import mode_from_config
+from combat_log_background import inspect_saved_background, WARNING_TEXT
 from update_manager import UpdateController, local_revision
 
 if sys.platform.startswith('linux'):
@@ -691,6 +692,7 @@ class App(tk.Tk):
         self.after(500, self.try_load_latest_result)
         self.after(650, self.configure_global_hotkey)
         self.after(800, self.monitor_continuous_live)
+        self.after(1900, self.refresh_background_status)
         self.after(100, self.poll_hotkey_event)
         self.after(1100, self.show_first_run_guide_if_needed)
 
@@ -778,6 +780,12 @@ class App(tk.Tk):
             style="Small.TLabel"
         )
         reminder.pack(anchor="w", pady=(8, 0))
+        self.background_alert_var = tk.StringVar(value=(
+            'Combat Log background: use solid opaque black (check starts in DDO).'))
+        self.background_alert_label = tk.Label(
+            control, textvariable=self.background_alert_var,
+            fg='#a36c12', anchor='w', justify='left', font=('Segoe UI', 9, 'bold'))
+        self.background_alert_label.pack(anchor='w', fill='x', pady=(4, 0))
 
         row2 = ttk.Frame(control)
         row2.pack(fill="x", pady=(12, 0))
@@ -2505,6 +2513,54 @@ class App(tk.Tk):
             pass
         return False
 
+    def refresh_background_status(self):
+        """Show live quality info without activating/stealing focus from DDO."""
+        try:
+            path = HERE / 'live_background_status.json'
+            active = self.live_proc is not None and self.live_proc.poll() is None
+            if active and path.exists():
+                data = json.loads(path.read_text(encoding='utf-8'))
+                # An older process may have left a stale status file.
+                fresh = time.time() - float(data.get('wall_epoch', 0)) < 600
+                state = data.get('state') if fresh else 'unknown'
+            else:
+                state = 'unknown'
+            if state == 'warning':
+                self.background_alert_var.set(
+                    'WARNING: Combat Log background is NOT solid black. '
+                    'Set DDO chat background to opaque black; results may be 0 or incomplete.')
+                self.background_alert_label.config(fg='#b22222')
+            elif state == 'black':
+                self.background_alert_var.set('Combat Log background: black - live check OK.')
+                self.background_alert_label.config(fg='#26713a')
+            else:
+                self.background_alert_var.set(
+                    'Combat Log background: set to solid opaque black; '
+                    'checking when DDO is in the foreground.')
+                self.background_alert_label.config(fg='#a36c12')
+        except Exception:
+            pass
+        self.after(2000, self.refresh_background_status)
+
+    def warn_if_session_background_nonblack(self, session):
+        """Warning is advisory, never prevents Replay/Reanalyze."""
+        try:
+            report = inspect_saved_background(session)
+            if report.get('status') == 'warning':
+                self.background_alert_var.set(
+                    'WARNING: saved Combat Log background is not black; analysis may show 0 damage.')
+                self.background_alert_label.config(fg='#b22222')
+                messagebox.showwarning(
+                    'Combat Log background warning',
+                    WARNING_TEXT + '\n\nThis session was recorded with a problematic '
+                    'background. Replay/Reanalyze will still run, but a zero '
+                    'or incomplete result is not trustworthy.')
+                return True
+        except Exception:
+            # Cannot examine some old recordings; do not block analysis.
+            pass
+        return False
+
     def monitor_continuous_live(self):
         if self.continuous_live_var.get() and not self.suppress_continuous_live:
             if self.live_proc is None or self.live_proc.poll() is not None:
@@ -3057,8 +3113,20 @@ class App(tk.Tk):
                     self.send_live_command(f"RESULT|{result_dps:.6f}|{self.result_display_seconds:.1f}")
                 self._beep(1450, 110, repeat=2)
 
+                background_warning = False
+                try:
+                    quality = json.loads((self.current_session / 'combat_log_background_check.json').read_text(encoding='utf-8'))
+                    background_warning = quality.get('status') == 'warning'
+                except Exception:
+                    pass
+                if background_warning:
+                    self.background_alert_var.set(
+                        'WARNING: saved Combat Log background is not black; damage may be incomplete or 0.')
+                    self.background_alert_label.config(fg='#b22222')
+                    self.set_status('Background warning - results may be incomplete', '#b22222')
+                    self.overview_note.config(text=WARNING_TEXT)
                 should_warn, details = self.detect_no_combat_log_activity(self.current_session)
-                if should_warn:
+                if should_warn and not background_warning:
                     self.set_status("No Combat Log activity detected", "#c98b16")
                     if not background:
                         messagebox.showwarning(
@@ -3135,7 +3203,14 @@ class App(tk.Tk):
                         "This replay checks live reconstruction/OCR/parser correctness on the saved capture. "
                         "It is not a real-time throughput test; the offline OCR queue waits instead of dropping lines.",
                     ])
-                    messagebox.showinfo("Replay live test", "\n".join(lines))
+                    quality = data.get('combat_log_background') or {}
+                    if quality.get('status') == 'warning':
+                        lines.extend(['', 'WARNING: Non-black/transparent Combat Log background detected.',
+                                      'Replay may return zero or incomplete damage. See replay_background_check.json.'])
+                        self.set_status('Replay: background warning', '#b22222')
+                        messagebox.showwarning('Replay live test - background warning', '\n'.join(lines))
+                    else:
+                        messagebox.showinfo("Replay live test", "\n".join(lines))
                 except Exception as e:
                     messagebox.showwarning(
                         "Replay live test",
@@ -3594,6 +3669,7 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Reanalysis", f"Could not select the session for reanalysis:\n\n{e}")
             return
+        self.warn_if_session_background_nonblack(session)
         self.current_session = session
         self.detail_label.config(text=session.name)
         self.analysis_background = False
@@ -3625,6 +3701,7 @@ class App(tk.Tk):
             messagebox.showerror("System not ready", "Run System check first.")
             return
 
+        self.warn_if_session_background_nonblack(session)
         self.current_session = session
         self.detail_label.config(text=session.name)
         self.analysis_background = False

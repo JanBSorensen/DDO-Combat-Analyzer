@@ -26,9 +26,14 @@ from post_numeric_guard import NumericGuard
 from attack_mode_audit import save as save_attack_audit
 from focus_resume_guard import recover_append_rows
 from combat_log_visibility import CombatLogVisibilityGuard
+from combat_log_background import inspect_saved_background, save_background_report, BackgroundMonitor, WARNING_TEXT
 from live_ocr_log import read_log
 from performance_mode import comparison_summary, mode_from_config
 from live_post_diagnostics import reconcile
+from damage_row_parser import (
+    damage_wrap_kind, join_damage_wrap, is_complete_outgoing, outgoing_b_token,
+    find_unparsed_candidates, NUM_TOKEN_WITH_B,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +41,7 @@ from live_post_diagnostics import reconcile
 # ---------------------------------------------------------------------------
 
 def locate_session(allow_live=False):
+    """Prefer the actual most recent session, including Light's video-free logs."""
     def eligible(folder):
         return ((folder / 'combat_changed_gray_ffv1.mkv').exists() or
                 (allow_live and (folder / 'config_used.json').exists()))
@@ -47,6 +53,7 @@ def locate_session(allow_live=False):
                 return p
         except Exception:
             pass
+
     sessions = [
         p for p in HERE.glob("combat_*")
         if p.is_dir() and eligible(p)
@@ -687,7 +694,7 @@ OCR_DIGIT_MAP = str.maketrans({
     "|": "1",
 })
 
-NUM_TOKEN = r"[0-9SOsoIl|,]+"
+NUM_TOKEN = NUM_TOKEN_WITH_B
 
 
 def parse_ocr_number(token):
@@ -835,53 +842,12 @@ def parse_reduction_type(line, damage_type=""):
     return normalize_reduction_type(m.group("reason"), damage_type)
 
 
-# Narrow two-row damage-wrap patterns.  These are intentionally much stricter
-# than the generic Combat-message reassembly: they only join a damage row that
-# ends immediately after "points of <type>" (or "points of") with the very
-# next visual OCR row that supplies "damage.".  This preserves the validated
-# one-row damage parser while recovering long wrapped sneak-attack lines.
-OUT_WRAP_TYPED_PREFIX_RE = re.compile(
-    rf"\bYou\s+(?P<kind>sneak\s+attack|hit)\s+"
-    rf"(?P<target>.+?)\s+for\s+"
-    rf"(?P<amount>{NUM_TOKEN})\s+points?\s+of\s+"
-    rf"(?P<dtype>[A-Za-z][A-Za-z -]*?)\s*$",
-    re.IGNORECASE,
-)
-OUT_WRAP_BARE_PREFIX_RE = re.compile(
-    rf"\bYou\s+(?P<kind>sneak\s+attack|hit)\s+"
-    rf"(?P<target>.+?)\s+for\s+"
-    rf"(?P<amount>{NUM_TOKEN})\s+points?\s+of\s*$",
-    re.IGNORECASE,
-)
+# Outgoing wrap matching is shared with live_overlay in damage_row_parser.py.
 
 
 def _clean_continuation_row(line):
     line = normalize_text(line)
     return re.sub(r"^[\|\[\]{}Il1:;`'.,_-]+\s*", "", line).strip()
-
-
-def damage_wrap_kind(line):
-    """Return 'typed', 'bare', or None for an incomplete outgoing damage row."""
-    line = normalize_text(line)
-    if OUT_WRAP_TYPED_PREFIX_RE.search(line):
-        return "typed"
-    if OUT_WRAP_BARE_PREFIX_RE.search(line):
-        return "bare"
-    return None
-
-
-def join_damage_wrap(prefix, continuation, kind=None):
-    """Return a complete logical damage row if this exact two-row wrap is valid."""
-    prefix = normalize_text(prefix)
-    cont = _clean_continuation_row(continuation)
-    kind = kind or damage_wrap_kind(prefix)
-    if kind == "typed":
-        if re.match(r"^damage\b", cont, re.IGNORECASE):
-            return normalize_text(prefix + " " + cont)
-    elif kind == "bare":
-        if re.match(r"^[A-Za-z][A-Za-z -]*?\s+damage\b", cont, re.IGNORECASE):
-            return normalize_text(prefix + " " + cont)
-    return None
 
 
 # Incoming visual wraps are handled only when the first row explicitly
@@ -970,16 +936,26 @@ def reassemble_wrapped_damage_rows(texts, line_times=None, stats=None):
         line = normalize_text(texts[i])
         elapsed = line_times[i] if line_times is not None and i < len(line_times) else None
         count = 1
-        if i + count < len(texts):
-            nxt = normalize_text(texts[i + count])
-            if not COMBAT_MESSAGE_START_RE.match(nxt):
-                outgoing_kind = damage_wrap_kind(line)
-                if outgoing_kind:
-                    joined = join_damage_wrap(line, nxt, outgoing_kind)
-                    if joined:
-                        line = joined
-                        count += 1
-                        outgoing_joins += 1
+        # Try up to three visual continuations, but only consume them when a
+        # syntactically *complete* outgoing damage message was reconstructed.
+        # This avoids swallowing unrelated messages after an OCR error.
+        joined = line
+        tentative_count = 1
+        if damage_wrap_kind(joined):
+            while i + tentative_count < len(texts) and tentative_count < 4:
+                nxt = normalize_text(texts[i + tentative_count])
+                if COMBAT_MESSAGE_START_RE.match(nxt):
+                    break
+                candidate = join_damage_wrap(joined, nxt)
+                if candidate is None:
+                    break
+                joined = candidate
+                tentative_count += 1
+                if is_complete_outgoing(joined):
+                    line = joined
+                    count = tentative_count
+                    outgoing_joins += 1
+                    break
         # Incoming damage, including 3-row wraps caused by long effects and
         # resistance messages. At most three extra rows may be consumed.
         inc_joined = False
@@ -2605,6 +2581,12 @@ def main():
         raise SystemExit(1)
 
     setup_t0 = time.perf_counter()
+    background_report = inspect_saved_background(session)
+    save_background_report(session, background_report)
+    if background_report['status'] == 'warning':
+        print('WARNING|COMBAT_LOG_BACKGROUND_NOT_BLACK|' + background_report['warning'], flush=True)
+        print('WARNING: A zero-damage FFV1 result may be caused by the visibility guard '
+              'rejecting frames from a non-black Combat Log.', flush=True)
 
     cfg_path = session / "config_used.json"
     if not cfg_path.exists():
@@ -2853,6 +2835,9 @@ def main():
     # can safely REBASELINE without OCR of old displayed Combat Log rows.
     visibility_guard = CombatLogVisibilityGuard(resume_frames=1)
     visibility_events = []
+    # In addition to early preflight, inspect periodic samples throughout the
+    # video. A user can change Combat Log transparency mid-session.
+    background_monitor = BackgroundMonitor(sample_seconds=2.0, confirm_samples=3)
     baseline_path = session / "baseline_gray.png"
     if baseline_path.exists():
         try:
@@ -2901,6 +2886,7 @@ def main():
         frame_no += 1
         _t = time.perf_counter()
         gray = np.frombuffer(data, dtype=np.uint8).reshape((height, width)).copy()
+        background_monitor.inspect(gray, now=float(saved_frame_times.get(frame_no, frame_no / 30.0)))
         feat = text_feature(gray)
         recon_profile["frame_preprocessing"] += time.perf_counter() - _t
 
@@ -3345,6 +3331,7 @@ def main():
         damage_texts, damage_times, damage_line_numbers, resolver=guard.resolve
     )
     guard.save(session / 'post_numeric_validation.csv')
+    coverage = save_damage_parse_coverage(session, texts, outgoing, 'ffv1_post')
     shutil.copy2(session / 'post_numeric_validation.csv', session / 'ffv1_post_numeric_validation.csv')
     parse_total_seconds = time.perf_counter() - damage_parse_t0
     timings.append(("damage_healing_parse", max(0.0, parse_total_seconds - guard.ocr_seconds)))
@@ -3383,6 +3370,8 @@ def main():
         session, texts, outgoing, incoming, healing, attacks, confirms, defensive_misses,
         corrections, suspicious, frame_no, len(visual_lines)
     )
+    append_damage_coverage_warning(session / 'COMBAT_REPORT.txt', coverage)
+    append_background_warning(session / 'COMBAT_REPORT.txt', background_report)
     # FFV1 is the independent post reference. Preserve its event-level output
     # separately from the earlier instant/live-derived report.
     shutil.copy2(session / 'damage_events.csv', session / 'ffv1_post_damage_events.csv')
@@ -3393,7 +3382,22 @@ def main():
     analysis_summary['analysis_source'] = 'ffv1_post'
     analysis_summary['data_quality']['numeric_validation'] = guard.stats
     analysis_summary['data_quality']['wrapped_damage_rows'] = wrap_stats
+    analysis_summary['data_quality']['damage_parse_coverage'] = coverage
+    background_report['full_video_periodic_scan'] = background_monitor.as_dict()
+    live_background = live_background_quality(session)
+    if background_monitor.ever_warned or live_background.get('status') == 'warning':
+        background_report['status'] = 'warning'
+        background_report['warning'] = WARNING_TEXT
+        background_report['warning_in_full_video_or_live'] = True
+    # Update both reports when periodic video inspection finds late changes.
+    save_background_report(session, background_report)
+    if background_report['status'] == 'warning':
+        append_background_warning(session / 'COMBAT_REPORT.txt', background_report)
+    analysis_summary['data_quality']['combat_log_background'] = background_report
+    if background_report['status'] == 'warning':
+        analysis_summary['data_quality']['warning_nonblack_background'] = background_report['warning']
     summary_path.write_text(json.dumps(analysis_summary, indent=2), encoding='utf-8')
+    shutil.copy2(session / 'COMBAT_REPORT.txt', session / 'ffv1_post_COMBAT_REPORT.txt')
     reconcile(session, source='ffv1_post', wrap_stats=wrap_stats, guard_stats=guard.stats)
     timings.append(("report_and_graph_generation", time.perf_counter() - report_t0))
     timing_details["report_and_graph_generation"] = "CSV/TXT, FFV1 snapshot and live/post event diagnostics"
@@ -3419,14 +3423,88 @@ def main():
     total_seconds = time.perf_counter() - total_t0
     timing_details["TOTAL"] = f"session={session.name}"
     write_post_analysis_timings(session, timings, total_seconds, timing_details)
+
     try:
         comparison_summary(session)
     except (OSError, ValueError):
         pass
-
     print("PROGRESS|DONE|1|1", flush=True)
     print("Analysis complete.", flush=True)
 
+
+
+def save_damage_parse_coverage(session, raw_texts, outgoing, source):
+    """Audit every damage-like OCR start against parsed outgoing events.
+
+    This is deliberately an independent count of raw OCR messages, not a
+    comparison of two paths through the same parsed-event list.  Zero-damage
+    reductions and unrelated `You hit ... with <effect>` are excluded.
+    """
+    unmatched = find_unparsed_candidates(raw_texts, [e['line'] for e in outgoing])
+    candidate_lines = [i for i, t in enumerate(raw_texts, 1)
+                       if re.search(r'\bYou\s+(?:sneak\s+attack|hit)\s+.+?\s+for\s+', t, re.I)]
+    record = {
+        'analysis_source': source,
+        'candidate_outgoing_damage_messages':len(candidate_lines),
+        'parsed_outgoing_damage_messages':len(outgoing),
+        'unmatched_candidate_count':len(unmatched),
+        'unmatched_candidate_lines':unmatched[:300],
+        'unmatched_examples':[{'source_line':i,'ocr_text':raw_texts[i-1]}
+                              for i in unmatched[:30]],
+    }
+    path=session/'damage_parse_coverage.json'
+    path.write_text(json.dumps(record,indent=2),encoding='utf-8')
+    if unmatched:
+        print(f'WARNING: {len(unmatched)} outgoing damage OCR messages were not '
+              f'parsed (see {path.name}).',flush=True)
+    return record
+
+
+def append_damage_coverage_warning(report_path, coverage):
+    """Put missed damage candidates at the very top of the human-readable report."""
+    n = int(coverage.get('unmatched_candidate_count', 0))
+    if not n:
+        return
+    report_path = Path(report_path)
+    if not report_path.is_file():
+        return
+    warning = (
+        f"WARNING: {n} damage-like Combat Log messages could not be parsed.\n"
+        "The damage total may be incomplete. Open damage_parse_coverage.json "
+        "for source line numbers.\n\n"
+    )
+    report_path.write_text(warning + report_path.read_text(encoding='utf-8'),
+                           encoding='utf-8')
+
+
+def append_background_warning(report_path, report):
+    """A valid-looking 0 must not conceal unsupported capture conditions."""
+    if not report or report.get('status') != 'warning':
+        return
+    path = Path(report_path)
+    if not path.is_file():
+        return
+    if path.read_text(encoding='utf-8').startswith('WARNING: Combat Log background was not visually solid black.'):
+        return
+    warning = (
+        'WARNING: Combat Log background was not visually solid black.\n'
+        'The session damage or DPS may be incomplete or zero because the '
+        'zoning/visibility guard can discard these video frames.\n'
+        'In DDO choose a solid opaque black Combat Log background. '
+        'See combat_log_background_check.json or live_background_check.json.\n\n'
+    )
+    path.write_text(warning + path.read_text(encoding='utf-8'), encoding='utf-8')
+
+
+def live_background_quality(session):
+    path = Path(session) / 'live_background_check.json'
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        affected = data.get('state') == 'warning' or data.get('ever_nonblack_this_session')
+        return {'status':'warning' if affected else data.get('state','inconclusive'),
+                'warning': WARNING_TEXT if affected else ''}
+    except (OSError, ValueError, KeyError):
+        return {'status':'inconclusive', 'warning':''}
 
 
 def _fast_live_analysis(session, log_rows, log_metadata):
@@ -3464,20 +3542,38 @@ def _fast_live_analysis(session, log_rows, log_metadata):
         amount = row.get('parsed_outgoing_damage', '')
         if not result or amount in ('', None):
             continue
+        # Reassociate verified numeric OCR from the completing visual row
+        # with the first row of the logical damage message.  Supports both
+        # 2- and 3-row wraps; never rely on a possibly shared timestamp.
         first_idx = idx
-        if idx > 0:
-            preceding = normalize_text(texts[idx-1])
-            following = normalize_text(texts[idx])
-            kind = damage_wrap_kind(preceding)
-            if kind and not COMBAT_MESSAGE_START_RE.match(following):
-                joined = join_damage_wrap(preceding, following, kind)
-                if joined and ((OUT_RE.search(joined) or OUT_UNTYPED_RE.search(joined)) is not None):
-                    first_idx = idx-1
-        trusted[first_idx+1] = {'result':result, 'final':amount}
+        for back in (1, 2, 3):
+            first = idx - back
+            if first < 0 or not damage_wrap_kind(texts[first]):
+                continue
+            fragments = texts[first:idx+1]
+            if any(COMBAT_MESSAGE_START_RE.match(t) for t in fragments[1:]):
+                continue
+            candidate = fragments[0]
+            for fragment in fragments[1:]:
+                candidate = join_damage_wrap(candidate, fragment)
+                if candidate is None:
+                    break
+            if candidate is not None and is_complete_outgoing(candidate):
+                first_idx = first
+                break
+        raw_line = texts[first_idx]
+        m = re.search(
+            rf'\bYou\s+(?:sneak\s+attack|hit)\s+.+?\s+for\s+'
+            rf'(?P<amount>{NUM_TOKEN})', raw_line, re.I)
+        original_token = m.group('amount') if m else ''
+        trusted[first_idx+1] = {
+            'result':result, 'final':amount, 'original_token':original_token
+        }
     guard = NumericGuard(trusted_live=trusted)
     outgoing, incoming, healing, corrections, suspicious = parse_combat_events(
         messages, message_times, message_lines, resolver=guard.resolve)
     guard.save(session / 'post_numeric_validation.csv')
+    coverage = save_damage_parse_coverage(session, texts, outgoing, 'live_ocr_fast')
     is_light = mode_from_config(json.loads((session / 'config_used.json').read_text(encoding='utf-8'))) == 'light'
     if not is_light:
         shutil.copy2(session / 'post_numeric_validation.csv', session / 'fast_live_numeric_validation.csv')
@@ -3488,13 +3584,16 @@ def _fast_live_analysis(session, log_rows, log_metadata):
     print('PROGRESS|PARSE|1|1', flush=True)
     create_reports(session, texts, outgoing, incoming, healing, attacks, confirms,
                    defensive_misses, corrections, suspicious, 0, len(texts))
+    append_damage_coverage_warning(session / 'COMBAT_REPORT.txt', coverage)
+    background_live = live_background_quality(session)
+    append_background_warning(session / 'COMBAT_REPORT.txt', background_live)
     if not is_light:
         shutil.copy2(session / 'damage_events.csv', session / 'fast_live_damage_events.csv')
         save_attack_audit(session, 'fast_live', attacks, confirms)
     report_path = session / 'COMBAT_REPORT.txt'
     if is_light:
         header = ('LIGHT MODE: LIVE OCR ONLY - NO FFV1 VIDEO WAS RECORDED\n'
-                  'Independent video reanalysis and replay are unavailable.\n\n')
+                  'Independent reanalysis and replay are unavailable for this session.\n\n')
     else:
         header = ('FAST RESULTS FROM LIVE OCR - NOT INDEPENDENT FFV1 POST ANALYSIS\n'
                   'Use Reanalyze (FFV1) in the GUI for the separate video-based result.\n\n')
@@ -3507,6 +3606,8 @@ def _fast_live_analysis(session, log_rows, log_metadata):
     summary['recording_mode'] = 'light' if is_light else 'full'
     summary['data_quality']['numeric_validation'] = guard.stats
     summary['data_quality']['wrapped_damage_rows'] = wrap_stats
+    summary['data_quality']['damage_parse_coverage'] = coverage
+    summary['data_quality']['live_background'] = background_live
     summary['data_quality']['live_ocr_complete'] = log_metadata.get('capture_ocr_complete')
     summary['data_quality']['live_ocr_dropped_crops'] = log_metadata.get('dropped_line_crops')
     summary_path.write_text(json.dumps(summary, indent=2), encoding='utf-8')
@@ -3537,7 +3638,7 @@ def prefer_live_main(wait_seconds=7.0, require_live=False):
             return
         if time.monotonic() >= deadline:
             if require_live or not (session / 'combat_changed_gray_ffv1.mkv').exists():
-                raise SystemExit('Light OCR did not finish in time. No video fallback exists.')
+                raise SystemExit('Light Mode OCR did not finish in time. The session is saved; no video fallback exists. Check live_ocr_complete.json or retry analysis.')
             print('Live OCR log not ready; automatically falling back to FFV1 post-analysis.',flush=True)
             main()
             return
@@ -3553,7 +3654,7 @@ if __name__ == "__main__":
                         help='Force independent FFV1 reconstruction and Indra OCR')
     parser.add_argument('--live-wait', type=float, default=7.0)
     parser.add_argument('--light', action='store_true',
-                        help='Video-free Light Mode: require finished live OCR, never FFV1 fallback')
+                        help='Video-free Light Mode: require completed live OCR, never fall back to FFV1')
     args = parser.parse_args()
     if args.prefer_live and not args.full_post:
         prefer_live_main(args.live_wait, require_live=args.light)

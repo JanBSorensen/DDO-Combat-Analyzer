@@ -17,6 +17,7 @@ import mss
 import tkinter as tk
 
 from live_overlay import LiveEstimator, make_clickthrough, is_ddo_foreground
+from combat_log_background import WARNING_TEXT, save_background_report
 from live_input_diagnostics import LiveInputDiagnostics
 
 HERE = Path(__file__).resolve().parent
@@ -84,7 +85,7 @@ def overlay_xy(cfg, width, height, fallback_mon):
 
 
 from live_ocr_log import new_row, write_log, filter_session_to_stop
-from performance_mode import LiveResourceTracker
+from performance_mode import LiveResourceTracker, mode_from_config
 from capture_geometry import rectangle, session_rectangle, write_comparison
 
 class ContinuousLiveEstimator(LiveEstimator):
@@ -122,6 +123,8 @@ class ContinuousLiveEstimator(LiveEstimator):
         self.session_live_samples = []
         self.session_ocr_rows = []
         # A short pre-session ring prevents lost OCR lines around START_SESSION.
+        # Light keeps only a short pre-session ring, never the idle history of
+        # a long-running game. Session rows themselves are still preserved.
         self.ocr_recent_rows = deque(maxlen=1024 if self.performance_mode == 'light' else 20000)
         self.session_resource_tracker = None
         self.focus_pause_started_epoch = None
@@ -158,6 +161,38 @@ class ContinuousLiveEstimator(LiveEstimator):
         self.zone_event_path = HERE / 'live_zone_diagnostics.jsonl'
         self.zone_event_lock = threading.Lock()
         self.zone_recent_events = deque(maxlen=256)
+        self.session_background_warned = False
+        self.background_status_path = HERE / 'live_background_status.json'
+        self._write_background_status('unknown', None)
+
+    def _write_background_status(self, state, sample):
+        record = {
+            'state': str(state),
+            'wall_epoch': time.time(),
+            'warning': WARNING_TEXT if state == 'warning' else '',
+            'sample': sample.as_dict() if sample is not None else None,
+            'recording': bool(getattr(self, 'session_collecting', False)),
+            'ever_nonblack_this_session': bool(getattr(self, 'session_background_warned', False)),
+        }
+        try:
+            tmp = self.background_status_path.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps(record, indent=2), encoding='utf-8')
+            tmp.replace(self.background_status_path)
+        except OSError:
+            pass
+        with self.session_lock:
+            path = self.session_path
+        if path is not None:
+            try:
+                save_background_report(path, record, filename='live_background_check.json')
+            except OSError:
+                pass
+
+    def on_background_quality_change(self, state, elapsed, sample):
+        super().on_background_quality_change(state, elapsed, sample)
+        if state == 'warning' and self.session_collecting:
+            self.session_background_warned = True
+        self._write_background_status(state, sample)
 
     def on_log_visibility_transition(self, event, elapsed, details):
         epoch = time.time()
@@ -220,6 +255,8 @@ class ContinuousLiveEstimator(LiveEstimator):
             self.session_geometry_written_for = path
 
     def write_status(self, **updates):
+        # Base live tracking calls this on the two actual focus transitions.
+        # Keep only elapsed intervals, without saving screen images in Light.
         if updates.get('capture_change_during_session'):
             self.capture_change_during_session = True
         if 'capture_paused_no_ddo_focus' not in updates:
@@ -229,10 +266,11 @@ class ContinuousLiveEstimator(LiveEstimator):
             if updates['capture_paused_no_ddo_focus']:
                 if self.focus_pause_started_epoch is None:
                     self.focus_pause_started_epoch = epoch
-            elif self.focus_pause_started_epoch is not None:
-                if self.session_start_epoch is not None and self.session_path is not None:
-                    self.session_focus_intervals.append((self.focus_pause_started_epoch, epoch))
-                self.focus_pause_started_epoch = None
+            else:
+                if self.focus_pause_started_epoch is not None:
+                    if self.session_start_epoch is not None and self.session_path is not None:
+                        self.session_focus_intervals.append((self.focus_pause_started_epoch, epoch))
+                    self.focus_pause_started_epoch = None
 
     def wait_for_clock(self):
         self.start_epoch = time.time()
@@ -412,6 +450,7 @@ class ContinuousLiveEstimator(LiveEstimator):
             # Attach diagnostics to THIS recording only, preserving the
             # exact live-MSS and Indra inputs until the session is flushed.
             if self.performance_mode == 'light':
+                # Avoid screenshot/row PNGs and heavy diagnostic history.
                 self.capture_diagnostics = None
             else:
                 try:
@@ -430,6 +469,20 @@ class ContinuousLiveEstimator(LiveEstimator):
             self.session_focus_intervals = []
             self.session_path = path
             self.last_session_path = path
+            self.session_background_warned = (self.background_monitor.state == 'warning')
+            # The background may already have failed the idle live check.
+            # Preserve that warning even if no transition occurs in combat.
+            try:
+                save_background_report(path, {
+                    'state': self.background_monitor.state,
+                    'warning': WARNING_TEXT if self.background_monitor.state == 'warning' else '',
+                    'sample': self.background_monitor.last_sample.as_dict()
+                    if self.background_monitor.last_sample else None,
+                    'at_session_start': True,
+                    'ever_nonblack_this_session': self.session_background_warned,
+                }, filename='live_background_check.json')
+            except OSError:
+                pass
             self.session_start_epoch = start_epoch
             self.session_start_elapsed = start_epoch - float(self.start_epoch)
             self.session_stop_elapsed = None
@@ -594,6 +647,8 @@ class ContinuousLiveEstimator(LiveEstimator):
 
         path.mkdir(parents=True, exist_ok=True)
         if self.performance_mode == 'light':
+            # Full recorder owns this CSV. Light has no FFV1 recorder, so save
+            # just the focus interruptions observed by the persistent live helper.
             focus_rows = []
             for began, ended in focus_windows:
                 start = max(float(began), float(started_epoch or began))
@@ -627,8 +682,10 @@ class ContinuousLiveEstimator(LiveEstimator):
             try:
                 metrics = self.session_resource_tracker.finish(
                     mode=self.performance_mode,
-                    fps=self.tracking_fps, threads=self.indra_threads,
-                    dropped_crops=dropped_during, ocr_rows=len(ocr_rows),
+                    fps=self.tracking_fps,
+                    threads=self.indra_threads,
+                    dropped_crops=dropped_during,
+                    ocr_rows=len(ocr_rows),
                     drained=session_ocr_drained)
                 (path / 'live_resource_usage.json').write_text(
                     json.dumps(metrics, indent=2), encoding='utf-8')
@@ -650,6 +707,8 @@ class ContinuousLiveEstimator(LiveEstimator):
                 row[1] = f'{float(row[1]):.6f}'
                 row[2] = f'{float(row[2]):.6f}'
                 if self.performance_mode == 'light':
+                    # Redundant full-batch OCR strings bloat files; original
+                    # per-line OCR evidence stays in live_ocr_lines.csv.
                     row[11] = ''
                 w.writerow(row)
 
@@ -661,6 +720,7 @@ class ContinuousLiveEstimator(LiveEstimator):
                 'window_seconds', 'window_damage', 'parsed_events_total', 'detected_lines_total',
                 'ocr_lines_total', 'ocr_queue_depth', 'dropped_lines_total',
                 'live_rolling_apm', 'window_attacks', 'parsed_attacks_total',
+                'session_cumulative_damage',
             ])
             w.writerows(live_rows)
 
@@ -718,6 +778,7 @@ class ContinuousLiveEstimator(LiveEstimator):
                 f'{rel:.6f}', f'{time.time():.6f}', f'{session_dps:.3f}',
                 f'{self.window_seconds:g}', int(window_damage), parsed, detected, ocr, int(qdepth), dropped,
                 f'{float(continuous_apm):.3f}', '', attacks,
+                int(self.session_final_total),
             ])
 
     def _reload_config_and_position(self):
@@ -918,8 +979,17 @@ class ContinuousLiveEstimator(LiveEstimator):
                         self.overlay_canvas.itemconfigure(self.apm_item, text=f'{int(round(apm))} APM')
                         self.overlay_canvas.itemconfigure(
                             self.detail_item,
-                            text=(f'LIVE {self.window_seconds:g}s  |  HEJSA  |  '
+                            text=('WARNING: COMBAT LOG BACKGROUND NOT BLACK'
+                                  if self.background_warning else
+                                  f'LIVE {self.window_seconds:g}s  |  HEJSA  |  '
                                   f'{"LOG HIDDEN" if self.zone_log_hidden else f"queue {qdepth}"}'))
+                elif kind == 'background_quality':
+                    if self.root is not None and self.overlay_canvas is not None:
+                        self.overlay_canvas.itemconfigure(
+                            self.detail_item,
+                            text=('WARNING: COMBAT LOG BACKGROUND NOT BLACK'
+                                  if self.background_warning else
+                                  f'LIVE {self.window_seconds:g}s  |  HEJSA'))
                 elif kind == 'reload_config':
                     self._reload_config_and_position()
                 elif kind == 'done':
@@ -948,7 +1018,16 @@ class ContinuousLiveEstimator(LiveEstimator):
 
             if foreground:
                 now_visible = time.monotonic()
-                if self.result_dps is not None and self.result_remaining_seconds > 0.0:
+                with self.session_lock:
+                    recording = bool(self.session_collecting)
+                    total_damage = int(self.session_final_total)
+                if recording:
+                    # True session-only cumulative damage, not the always-on
+                    # rolling DPS window and not damage before Pause/Break.
+                    self.overlay_canvas.itemconfigure(
+                        self.result_item, text=f'TOTAL DAMAGE: {total_damage:,}')
+                    self.result_last_visible_tick = None
+                elif self.result_dps is not None and self.result_remaining_seconds > 0.0:
                     if self.result_last_visible_tick is not None:
                         self.result_remaining_seconds = max(
                             0.0,

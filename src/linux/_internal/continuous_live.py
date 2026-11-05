@@ -17,6 +17,7 @@ import mss
 import tkinter as tk
 
 from live_overlay import LiveEstimator, make_clickthrough, is_ddo_foreground
+from combat_log_background import WARNING_TEXT, save_background_report
 from live_input_diagnostics import LiveInputDiagnostics
 
 if sys.platform.startswith('linux'):
@@ -166,6 +167,38 @@ class ContinuousLiveEstimator(LiveEstimator):
         self.zone_event_path = HERE / 'live_zone_diagnostics.jsonl'
         self.zone_event_lock = threading.Lock()
         self.zone_recent_events = deque(maxlen=256)
+        self.session_background_warned = False
+        self.background_status_path = HERE / 'live_background_status.json'
+        self._write_background_status('unknown', None)
+
+    def _write_background_status(self, state, sample):
+        record = {
+            'state': str(state),
+            'wall_epoch': time.time(),
+            'warning': WARNING_TEXT if state == 'warning' else '',
+            'sample': sample.as_dict() if sample is not None else None,
+            'recording': bool(getattr(self, 'session_collecting', False)),
+            'ever_nonblack_this_session': bool(getattr(self, 'session_background_warned', False)),
+        }
+        try:
+            tmp = self.background_status_path.with_suffix('.json.tmp')
+            tmp.write_text(json.dumps(record, indent=2), encoding='utf-8')
+            tmp.replace(self.background_status_path)
+        except OSError:
+            pass
+        with self.session_lock:
+            path = self.session_path
+        if path is not None:
+            try:
+                save_background_report(path, record, filename='live_background_check.json')
+            except OSError:
+                pass
+
+    def on_background_quality_change(self, state, elapsed, sample):
+        super().on_background_quality_change(state, elapsed, sample)
+        if state == 'warning' and self.session_collecting:
+            self.session_background_warned = True
+        self._write_background_status(state, sample)
 
     def on_log_visibility_transition(self, event, elapsed, details):
         epoch = time.time()
@@ -438,6 +471,20 @@ class ContinuousLiveEstimator(LiveEstimator):
             self.session_focus_intervals = []
             self.session_path = path
             self.last_session_path = path
+            self.session_background_warned = (self.background_monitor.state == 'warning')
+            # The background may already have failed the idle live check.
+            # Preserve that warning even if no transition occurs in combat.
+            try:
+                save_background_report(path, {
+                    'state': self.background_monitor.state,
+                    'warning': WARNING_TEXT if self.background_monitor.state == 'warning' else '',
+                    'sample': self.background_monitor.last_sample.as_dict()
+                    if self.background_monitor.last_sample else None,
+                    'at_session_start': True,
+                    'ever_nonblack_this_session': self.session_background_warned,
+                }, filename='live_background_check.json')
+            except OSError:
+                pass
             self.session_start_epoch = start_epoch
             self.session_start_elapsed = start_epoch - float(self.start_epoch)
             self.session_stop_elapsed = None
@@ -937,8 +984,17 @@ class ContinuousLiveEstimator(LiveEstimator):
                         self.overlay_canvas.itemconfigure(self.apm_item, text=f'{int(round(apm))} APM')
                         self.overlay_canvas.itemconfigure(
                             self.detail_item,
-                            text=(f'LIVE {self.window_seconds:g}s  |  HEJSA  |  '
+                            text=('WARNING: COMBAT LOG BACKGROUND NOT BLACK'
+                                  if self.background_warning else
+                                  f'LIVE {self.window_seconds:g}s  |  HEJSA  |  '
                                   f'{"LOG HIDDEN" if self.zone_log_hidden else f"queue {qdepth}"}'))
+                elif kind == 'background_quality':
+                    if self.root is not None and self.overlay_canvas is not None:
+                        self.overlay_canvas.itemconfigure(
+                            self.detail_item,
+                            text=('WARNING: COMBAT LOG BACKGROUND NOT BLACK'
+                                  if self.background_warning else
+                                  f'LIVE {self.window_seconds:g}s  |  HEJSA'))
                 elif kind == 'reload_config':
                     self._reload_config_and_position()
                 elif kind == 'done':

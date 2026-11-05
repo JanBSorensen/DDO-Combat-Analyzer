@@ -35,6 +35,11 @@ from live_input_diagnostics import LiveInputDiagnostics
 from focus_resume_guard import recover_append_rows
 from capture_geometry import rectangle
 from combat_log_visibility import CombatLogVisibilityGuard
+from combat_log_background import BackgroundMonitor, WARNING_TEXT, save_background_report
+from damage_row_parser import (
+    damage_wrap_kind, join_damage_wrap, is_complete_outgoing,
+    outgoing_b_token, b_number_candidates, NUM_TOKEN_WITH_B,
+)
 
 OCR_DIGIT_MAP = str.maketrans({
     "S": "5",
@@ -45,7 +50,7 @@ OCR_DIGIT_MAP = str.maketrans({
     "l": "1",
     "|": "1",
 })
-NUM_TOKEN = r"[0-9SOsoIl|,]+"
+NUM_TOKEN = NUM_TOKEN_WITH_B
 
 OUT_RE = re.compile(
     rf"\bYou\s+(?:sneak\s+attack|hit)\s+"
@@ -65,41 +70,11 @@ OUT_UNTYPED_RE = re.compile(
 # long DDO damage message wraps before the final word "damage.".
 OUT_AMOUNT_LOOSE_RE = re.compile(
     rf"\bYou\s+(?:sneak\s+attack|hit)\s+.+?\s+for\s+"
-    rf"(?P<amount>{NUM_TOKEN})\s+points?\b",
+    rf"(?P<amount>{NUM_TOKEN})(?:\s+points?\b|\s*$)",
     re.IGNORECASE,
 )
 
-OUT_WRAP_TYPED_PREFIX_RE = re.compile(
-    rf"\bYou\s+(?:sneak\s+attack|hit)\s+.+?\s+for\s+"
-    rf"{NUM_TOKEN}\s+points?\s+of\s+[A-Za-z][A-Za-z -]*?\s*$",
-    re.IGNORECASE,
-)
-OUT_WRAP_BARE_PREFIX_RE = re.compile(
-    rf"\bYou\s+(?:sneak\s+attack|hit)\s+.+?\s+for\s+"
-    rf"{NUM_TOKEN}\s+points?\s+of\s*$",
-    re.IGNORECASE,
-)
-
-
-def damage_wrap_kind(line):
-    line = normalize_text(line)
-    if OUT_WRAP_TYPED_PREFIX_RE.search(line):
-        return "typed"
-    if OUT_WRAP_BARE_PREFIX_RE.search(line):
-        return "bare"
-    return None
-
-
-def join_damage_wrap(prefix, continuation, kind=None):
-    prefix = normalize_text(prefix)
-    cont = normalize_text(continuation)
-    cont = re.sub(r"^[\|\[\]{}Il1:;`'.,_-]+\s*", "", cont).strip()
-    kind = kind or damage_wrap_kind(prefix)
-    if kind == "typed" and re.match(r"^damage\b", cont, re.IGNORECASE):
-        return normalize_text(prefix + " " + cont)
-    if kind == "bare" and re.match(r"^[A-Za-z][A-Za-z -]*?\s+damage\b", cont, re.IGNORECASE):
-        return normalize_text(prefix + " " + cont)
-    return None
+# Shared outgoing wrap recognition is defined in damage_row_parser.py.
 
 ATTACK_RE = re.compile(
     rf"\bYou\s+attack\s+(?P<target>.+?)\.\s+You\s+roll\s+a\s+"
@@ -893,7 +868,7 @@ class LiveEstimator:
         self.start_epoch = None
         self.events = deque()  # (capture_elapsed_seconds, amount)
         self.attacks = deque()  # capture_elapsed_seconds for player attack-roll lines
-        self.pending_damage_wrap = None  # (elapsed, text, kind, crop)
+        self.pending_damage_wrap = None  # (elapsed, joined_text, kind, first_crop, rows)
         self.pending_bottom_lock = threading.Lock()
         self.pending_bottom_line = None  # y0, elapsed, partial_crop, line_height
         self.bottom_deferred_total = 0
@@ -938,11 +913,16 @@ class LiveEstimator:
         self.capture_applied_event = threading.Event()
         self.capture_applied_event.set()
         self.capture_refreshes = 0
+        # Live black-background preflight is independent of the zoning guard.
+        self.background_monitor = BackgroundMonitor(sample_seconds=2.0, confirm_samples=3)
+        self.background_warning = False
+        self.background_warning_during_session = False
 
         self.root = None
         self.overlay_canvas = None
         self.value_item = None
         self.apm_item = None
+        self.total_item = None
         self.detail_item = None
 
     def write_status(self, **updates):
@@ -955,6 +935,27 @@ class LiveEstimator:
     def on_log_visibility_transition(self, event, elapsed, details):
         """Optional, low-frequency event hook; never write per-frame debug images."""
         return
+
+    def on_background_quality_change(self, state, elapsed, sample):
+        """Alert only; quality warnings never change visibility or drop frames."""
+        self.background_warning = (state == 'warning')
+        if self.background_warning and self.session != HERE:
+            self.background_warning_during_session = True
+        if self.overlay_enabled:
+            self.update_queue.put(('background_quality', state))
+        # Standalone Full recording (continuous mode off) still records the
+        # background warning, even without a persistent live helper.
+        if self.session != HERE and self.session.is_dir():
+            try:
+                save_background_report(self.session, {
+                    'state': state,
+                    'wall_epoch': time.time(),
+                    'warning': WARNING_TEXT if self.background_warning_during_session else '',
+                    'ever_nonblack_this_session': self.background_warning_during_session,
+                    'sample': sample.as_dict() if sample is not None else None,
+                }, filename='live_background_check.json')
+            except OSError:
+                pass
 
     def wait_for_clock(self):
         deadline = time.time() + 8.0
@@ -1326,31 +1327,71 @@ class LiveEstimator:
                     numeric_recheck_ms = ""
                     numeric_recheck_text = ""
 
-                    # Recover only the safe two-row damage wrap used by DDO,
-                    # e.g. "... 37,225 points of pierce" + "damage.".
+                    # Reconstruct only syntactically valid contiguous outgoing
+                    # damage continuations. The first OCR row can end immediately
+                    # after the amount (real Windows 59-char regression), after
+                    # "points", after "points of", or after the damage type.
+                    # Up to three continuation rows are supported. Never cross
+                    # a Combat message or a recording boundary.
+                    pending_partial = False
                     if self.pending_damage_wrap is not None:
-                        p_elapsed, p_text, p_kind, p_crop = self.pending_damage_wrap
+                        p_elapsed, p_text, p_kind, p_crop, p_rows = self.pending_damage_wrap
                         self.pending_damage_wrap = None
-                        # Never bridge a two-line damage message across a live
-                        # session boundary. A stale pre-boundary first half must
-                        # not consume a fresh post-boundary line.
                         if float(p_elapsed) + 1e-6 >= live_accept_after:
                             joined = join_damage_wrap(p_text, text, p_kind)
                             if joined:
-                                parse_text = joined
-                                event_elapsed = p_elapsed
-                                event_crop = p_crop
+                                if is_complete_outgoing(joined):
+                                    parse_text = joined
+                                    event_elapsed = p_elapsed
+                                    event_crop = p_crop
+                                elif p_rows < 4 and damage_wrap_kind(joined):
+                                    self.pending_damage_wrap = (
+                                        p_elapsed, joined, damage_wrap_kind(joined),
+                                        p_crop, p_rows + 1)
+                                    pending_partial = True
 
                     amount, amount_token, amount_format_valid = (
                         parse_outgoing_damage_details(parse_text)
-                        if parse_text else (None, "", False)
+                        if parse_text and not pending_partial else (None, "", False)
                     )
                     raw_amount = amount
                     correction_applied = ""
-                    if amount is None and parse_text == text and accepted_for_live:
+                    if (amount is None and not pending_partial and
+                        parse_text == text and accepted_for_live):
                         wrap_kind = damage_wrap_kind(text)
                         if wrap_kind:
-                            self.pending_damage_wrap = (elapsed, text, wrap_kind, crop)
+                            self.pending_damage_wrap = (elapsed, text, wrap_kind, crop, 1)
+
+                    # A B occurs only in OCR, never in a DDO damage number.
+                    # A small number of ambiguous crops can be re-read without
+                    # adding an OCR pass to all normal damage rows.
+                    suspicious_b = outgoing_b_token(parse_text) if not pending_partial else None
+                    if suspicious_b:
+                        vr0 = time.perf_counter()
+                        variants = (self.ocr_indra_single_variants(event_crop)
+                                    if event_crop is not None else [])
+                        verified = []
+                        for vt in variants:
+                            va, _vtoken, vvalid = parse_outgoing_damage_details(vt, loose=True)
+                            if va is not None and vvalid:
+                                verified.append((va, vt))
+                        if verified and len({v for v, _ in verified}) == 1:
+                            amount, numeric_recheck_text = verified[0]
+                            numeric_recheck = 'b_ocr_verified'
+                            correction_applied = 'b_to_8_ocr_verified'
+                        else:
+                            candidates = b_number_candidates(suspicious_b)
+                            if len(candidates) == 1:
+                                amount = next(iter(candidates))
+                                numeric_recheck = 'b_format_inferred'
+                                correction_applied = 'b_to_8_ddo_format'
+                                numeric_recheck_text = 'unique DDO-formatted value'
+                            else:
+                                amount = None
+                                numeric_recheck = 'b_unresolved'
+                                numeric_recheck_text = ' | '.join(variants)[:240]
+                        numeric_recheck_ms = f"{(time.perf_counter()-vr0)*1000:.1f}"
+                        numeric_recheck_amount = amount if amount is not None else ""
 
                     # DDO always prints thousands separators.  A damage token such
                     # as 11388 is therefore invalid on its face: DDO would have
@@ -1359,7 +1400,7 @@ class LiveEstimator:
                     # accept a comma-as-1 repair only when the DDO grouping rule
                     # yields exactly one candidate.  Otherwise reject the number
                     # rather than create a false live-DPS spike.
-                    if amount is not None and not amount_format_valid:
+                    if amount is not None and not amount_format_valid and not suspicious_b:
                         vr0 = time.perf_counter()
                         verify_texts = self.ocr_indra_single_variants(event_crop) if event_crop is not None else []
                         verified = []
@@ -1393,7 +1434,7 @@ class LiveEstimator:
                     # still look like a valid comma-formatted number, e.g.
                     # 9,197 -> 91,197.  Only an isolated OCR read that matches an
                     # exact 11 -> 1 collapse is allowed to change such a value.
-                    elif needs_live_numeric_recheck(amount) and event_crop is not None:
+                    elif not suspicious_b and needs_live_numeric_recheck(amount) and event_crop is not None:
                         collapse_candidates = duplicated_one_collapse_candidates(amount)
                         vr0 = time.perf_counter()
                         verify_texts = self.ocr_indra_single_variants(event_crop)
@@ -1664,6 +1705,8 @@ class LiveEstimator:
                                 align_age_frames = 0
                                 focus_resume_pending = False
                                 visibility_guard.reset_for_geometry_change()
+                                self.background_monitor.reset()
+                                self.on_background_quality_change('unknown', 0.0, None)
                                 self.clear_pending_bottom_line(count_drop=True)
                                 self.line_height_candidates = []
                                 if self.auto_line_height:
@@ -1757,6 +1800,18 @@ class LiveEstimator:
                         try:
                             diag.capture_frame(elapsed, bgra, gray)
                         except Exception:
+                            pass
+                    # Check the already-captured pixels only every ~2 seconds.
+                    # Do NOT turn a non-black background into a zoning signal;
+                    # the separate visibility guard owns that decision.
+                    background_transition, background_sample = self.background_monitor.inspect(
+                        gray, now=time.monotonic())
+                    if background_transition:
+                        try:
+                            self.on_background_quality_change(
+                                background_transition, elapsed, background_sample)
+                        except Exception:
+                            # A diagnostic failure must not stop live capture.
                             pass
                     feat = fast_text_feature(gray)
                     self.tracking_frames += 1
@@ -2253,8 +2308,13 @@ class LiveEstimator:
             text="0 APM", fill="#ff5050", font=("Segoe UI", 22, "bold"),
             anchor="center"
         )
+        self.total_item = self.overlay_canvas.create_text(
+            width // 2, 136,
+            text="TOTAL DAMAGE: 0", fill="#ffd060", font=("Segoe UI", 16, "bold"),
+            anchor="center"
+        )
         self.detail_item = self.overlay_canvas.create_text(
-            width // 2, 127,
+            width // 2, 171,
             text=f"LIVE {self.window_seconds:g}s  |  HEJSA", fill="#ff9090", font=("Segoe UI", 10, "bold"),
             anchor="center"
         )
@@ -2290,10 +2350,24 @@ class LiveEstimator:
                     self.overlay_canvas.itemconfigure(
                         self.apm_item, text=f"{int(round(apm))} APM"
                     )
+                    with self.live_event_records_lock:
+                        session_total = int(self.live_corrected_damage_total)
+                    self.overlay_canvas.itemconfigure(
+                        self.total_item, text=f"TOTAL DAMAGE: {session_total:,}"
+                    )
                     self.overlay_canvas.itemconfigure(
                         self.detail_item,
-                        text=f"LIVE {self.window_seconds:g}s  |  HEJSA  |  queue {qdepth}"
+                        text=('WARNING: COMBAT LOG BACKGROUND NOT BLACK'
+                              if self.background_warning else
+                              f'LIVE {self.window_seconds:g}s  |  HEJSA  |  queue {qdepth}')
                     )
+                elif kind == 'background_quality':
+                    if self.root is not None and self.overlay_canvas is not None:
+                        self.overlay_canvas.itemconfigure(
+                            self.detail_item,
+                            text=('WARNING: COMBAT LOG BACKGROUND NOT BLACK'
+                                  if self.background_warning else
+                                  f'LIVE {self.window_seconds:g}s  |  HEJSA'))
                 elif kind == "done":
                     if self.root is not None:
                         self.root.destroy()

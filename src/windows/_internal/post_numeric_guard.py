@@ -10,6 +10,7 @@ import itertools
 import re
 import time
 from pathlib import Path
+from damage_row_parser import b_number_candidates
 
 DIGIT_MAP = str.maketrans({'S':'5','s':'5','O':'0','o':'0','I':'1','l':'1','|':'1'})
 DDO_GROUPS = re.compile(r'^\d{1,3}(?:,\d{3})*$')
@@ -63,7 +64,9 @@ class NumericGuard:
         self.trusted_live = trusted_live or {}
         self.rows = []
         self.stats = {'accepted':0, 'lookalike':0, 'verified':0, 'comma_inferred':0,
-                      'collapsed_11':0, 'confirmed_11':0, 'rejected':0, 'unresolved_11':0}
+                      'collapsed_11':0, 'confirmed_11':0, 'rejected':0, 'unresolved_11':0,
+                      'b_ocr_verified':0, 'b_live_verified':0, 'b_format_inferred':0,
+                      'b_rejected':0}
         self._recheck_cache = {}
         self.ocr_seconds = 0.0
 
@@ -105,7 +108,7 @@ class NumericGuard:
         # Isolated OCR does not always include the wrap's final 'damage'.
         if field == 'damage':
             m = re.search(r'\bYou\s+(?:sneak\s+attack|hit)\s+.+?\s+for\s+'
-                          r'(?P<amount>[0-9SOsoIl|,]+)\s+points?\b', text, re.I)
+                          r'(?P<amount>[0-9SOsoIl|Bb,]+)(?:\s+points?\b|\s*$)', text, re.I)
             if m:
                 return m.group('amount')
         for pat in patterns:
@@ -123,6 +126,49 @@ class NumericGuard:
         evidence = ''
         if acceptable and original != cleaned(original):
             action = 'lookalike'
+
+        # A 2026-11-05 Windows test exposed B-for-8 OCR, including B8,219
+        # (possibly duplicated 8). Recheck ONLY these suspicious rows and do
+        # not silently treat B as 8 in the general numeric parser.
+        if re.search(r'[Bb]', original):
+            variants = self._ocr_rechecks(lineno)
+            verified = []
+            for candidate_text in variants:
+                candidate = self._field_token(candidate_text, field)
+                if candidate is not None and valid(candidate):
+                    verified.append((value(candidate), candidate_text))
+            if verified and len({v for v, _ in verified}) == 1:
+                result, evidence = verified[0]
+                action = 'b_ocr_verified'
+            else:
+                result = None
+                evidence = ' | '.join(variants)[:240]
+                trusted = self.trusted_live.get(int(lineno)) if field == 'damage' else None
+                if (trusted and trusted.get('result') == 'b_ocr_verified' and
+                    trusted.get('original_token', '').lower() == original.lower()):
+                    try:
+                        live_value = int(trusted['final'])
+                        if live_value >= 0:
+                            result, action = live_value, 'b_live_verified'
+                            evidence = 'verified against original live OCR crop'
+                    except (ValueError, TypeError, KeyError):
+                        pass
+                if result is None:
+                    possibilities = b_number_candidates(original)
+                    if len(possibilities) == 1:
+                        result, action = next(iter(possibilities)), 'b_format_inferred'
+                        evidence = 'unique DDO thousands-separator candidate'
+                    else:
+                        action = 'b_rejected'
+                        evidence = evidence or 'ambiguous B/8 numeric glyph'
+            self.stats[action] = self.stats.get(action, 0) + 1
+            self.rows.append({
+                'source_line':lineno, 'field':field, 'original_token':original,
+                'normalized_token':cleaned(original), 'initial_value':initial,
+                'final_value':result if result is not None else '',
+                'action':action, 'recheck_evidence':evidence, 'ocr_line':line,
+            })
+            return result, original, cleaned(original), result is not None
         # Live OCR's completed numeric recheck is first-class evidence for the
         # quick report, but only for the same outgoing OCR row/number field.
         trusted = self.trusted_live.get(int(lineno)) if field == 'damage' else None
@@ -131,8 +177,20 @@ class NumericGuard:
         ):
             try:
                 trusted_result = int(trusted['final'])
-                if trusted_result >= 0 and (not acceptable or trusted_result == initial or
-                                             trusted_result in collapse_11_candidates(initial)):
+                # NEVER accept an arbitrary trusted value merely because the
+                # original token has invalid grouping. The previous build
+                # accidentally replaced 4,547 with a separate 116-damage hit.
+                compatible = (trusted_result == initial or
+                              trusted_result in collapse_11_candidates(initial) or
+                              trusted_result in {v for v, _ in comma_one_candidates(original)})
+                # A second isolated OCR read can correct *other* garbled
+                # characters (for example 34106 -> 3,106). Accept this only
+                # if the result belongs to the exact same reconstructed OCR
+                # source line and its raw amount token, never a shared time.
+                if (not acceptable and trusted.get('result') == 'ddo_format_verified' and
+                    trusted.get('original_token', '') == original):
+                    compatible = True
+                if trusted_result >= 0 and compatible:
                     result = trusted_result
                     action = 'verified_live'
                     evidence = trusted.get('result', '')

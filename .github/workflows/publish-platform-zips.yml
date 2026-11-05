@@ -38,6 +38,13 @@ jobs:
               assert (internal / 'record_light.py').is_file()
               assert (internal / 'capture_geometry.py').is_file()
               assert (internal / 'combat_log_visibility.py').is_file()
+              assert (internal / 'combat_log_background.py').is_file()
+              assert (internal / 'damage_row_parser.py').is_file()
+              assert (internal / 'session_resource_monitor.py').is_file()
+              assert (Path('src') / platform / 'tests' / 'test_background_black.py').is_file()
+              import json
+              assert json.loads((internal / 'config.json').read_text())['performance']['mode'] == 'light'
+              assert "'mode', 'light'" in (internal / 'performance_mode.py').read_text()
               assert 'visibility_guard.inspect(gray)' in (internal / 'live_overlay.py').read_text()
               assert 'def _preflight_capture(' in (internal / 'continuous_live.py').read_text()
               assert "self.performance_combo" in (internal / 'DDO Combat Analyzer.pyw').read_text()
@@ -47,6 +54,15 @@ jobs:
               assert 'self.version_label = ttk.Label' in (internal / 'DDO Combat Analyzer.pyw').read_text()
               print(platform, 'Python syntax and updater UI OK')
           PY
+
+      - name: Run 16 parser, numeric and background regression tests on both platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet numpy opencv-python-headless
+          for platform in windows linux; do
+            ( cd "src/$platform" && python -m unittest discover -s tests -v )
+          done
 
       - name: Build independently installable Windows and Linux ZIPs
         shell: bash
@@ -100,8 +116,8 @@ jobs:
 
           - **New:** Full/Light selector in the same GUI on both platforms; Full retains lossless FFV1 video, independent post reanalysis and Replay Live.
           - **Light:** 20-FPS OCR tracking, at most 2 OCR threads, no FFmpeg/video capture or redundant screenshot diagnostics. Saved live OCR supports rebuilding reports, not independent video reanalysis.
-          - **Unchanged:** Entire Combat Log selection, damage/attack/crit parsing, Live DPS/APM, overlay and updater. Full remains the default.
-          - **Added:** session-level resource and quality comparison summaries; CPU/RAM are measured for OCR helper only.
+          - **Default:** Light on NEW installations; saved Full/Light preferences are preserved. Full is still available for independent FFV1 video reanalysis and replay.
+          - **Fixed:** Wrapped 2-4-line damage/sneak attacks, cautious B/8 OCR verification, numeric guard, damage-parse coverage and black-background quality warnings (live and saved Full video).
           - **Capture sync:** Live OCR refreshes the exact Combat Log rectangle before each Full/Light recording and verifies it against the recorder; mismatches abort live collection instead of silently corrupting DPS.
           - **Scroll recovery:** Confident prior-frame alignment recovers scrolls missed by stale anchors; long unresolved stalls are diagnosed rather than guessed.
           - **Zoning protection:** Detects loading/hidden Combat Log, suspends OCR while hidden and re-baselines on return to avoid re-counting old damage. Rolling DPS still decays after the selected inactivity window.
@@ -110,7 +126,7 @@ jobs:
           - **Windows:** Download DDO-Combat-Analyzer-Windows.zip, extract it, run SETUP DDO Combat Analyzer.cmd once, then START DDO Combat Analyzer.cmd.
           - **Linux (Mint/Cinnamon X11):** Download DDO-Combat-Analyzer-Linux.zip, extract it, run bash 'SETUP DDO Combat Analyzer.sh' once, then ./START_DDO_COMBAT_ANALYZER.sh.
           - **Data safety:** Updating keeps existing config.json, capture area, OCR/Python installations and combat sessions.
-          - **Known investigation:** Live OCR truncation on a particular Windows system is still under investigation; no speculative parsing workaround is included.
+          - **Verification:** Windows Full and Light have matched observed target HP in real sessions; automated parser/background regression tests on both platforms. Linux native X11 in-game validation is still recommended.
           - Both ZIPs include the application source and license notices. Third-party dependencies and Indra model weights have separate licenses.
           - Source commit: ${GITHUB_SHA}.
           EOF

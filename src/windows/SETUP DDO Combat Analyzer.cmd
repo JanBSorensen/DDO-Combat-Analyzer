@@ -213,7 +213,7 @@ echo [4/6] Installing/updating core Python packages...
 "!PYEXE!" -m ensurepip --upgrade >nul 2>nul
 "!PYEXE!" -m pip install --upgrade pip
 if errorlevel 1 echo WARNING: pip upgrade failed. Continuing with the installed pip.
-"!PYEXE!" -m pip install --upgrade mss opencv-python numpy
+"!PYEXE!" -m pip install --upgrade mss opencv-python numpy psutil
 if errorlevel 1 (
     echo.
     echo ERROR: Required Python packages could not be installed.
@@ -241,7 +241,7 @@ if errorlevel 1 (
 echo.
 
 echo [6/6] Verifying installation and saving Python paths...
-"!PYEXE!" -c "import tkinter, mss, cv2, numpy, indra_ocr; r=tkinter.Tk(); r.withdraw(); r.update(); r.destroy(); print('GUI prerequisites: OK')"
+"!PYEXE!" -c "import tkinter, mss, cv2, numpy, indra_ocr, psutil; r=tkinter.Tk(); r.withdraw(); r.update(); r.destroy(); print('GUI prerequisites: OK')"
 if errorlevel 1 (
     echo.
     echo ERROR: Python module or GUI verification failed.

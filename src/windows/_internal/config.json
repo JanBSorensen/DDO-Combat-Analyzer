@@ -32,7 +32,7 @@
     "whole_frame_confident_positive_improvement": 0.08,
     "zero_first_enabled": true,
     "zero_first_threshold": 0.995,
-    "combat_inactivity_timeout_seconds": 5
+    "combat_inactivity_timeout_seconds": 5.0
   },
   "status_every_seconds": 5,
   "capture_configured": false,
@@ -54,16 +54,16 @@
     "indra_threads": "auto",
     "continuous_mode": true,
     "recording_hotkey": "Pause/Break",
-    "result_display_seconds": 10,
+    "result_display_seconds": 10.0,
     "overlay_x_ratio": 0.5,
     "overlay_y_ratio": 0.12,
     "font_size": 24,
-    "rolling_window_seconds": 15
+    "rolling_window_seconds": 15.0
   },
   "ui": {
     "first_run_guide_shown": false
   },
   "performance": {
-    "mode": "full"
+    "mode": "light"
   }
 }

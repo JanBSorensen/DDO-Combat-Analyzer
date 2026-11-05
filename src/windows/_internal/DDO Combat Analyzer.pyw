@@ -28,7 +28,7 @@ def read_performance_mode():
     try:
         return mode_from_config(json.loads(CONFIG.read_text(encoding='utf-8')))
     except (ValueError, OSError):
-        return 'full'
+        return 'light'
 
 
 def save_performance_mode(mode):
@@ -37,19 +37,20 @@ def save_performance_mode(mode):
     cfg = json.loads(CONFIG.read_text(encoding='utf-8'))
     cfg.setdefault('performance', {})['mode'] = mode
     if mode == 'light':
+        # Light requires the existing persistent live OCR process; it does not
+        # create an independent screen recorder.
         cfg.setdefault('live_dps', {})['continuous_mode'] = True
     temp = CONFIG.with_suffix('.json.tmp')
     temp.write_text(json.dumps(cfg, indent=2), encoding='utf-8')
     temp.replace(CONFIG)
 
-
 from cpu_utils import physical_core_count, resolve_indra_threads
-from performance_mode import mode_from_config
 from update_manager import UpdateController, local_revision
+from performance_mode import mode_from_config
+from combat_log_background import inspect_saved_background, WARNING_TEXT
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 SW_RESTORE = 9
-
 
 def installed_version_label():
     """Show the exact source revision from the installed GitHub release."""
@@ -112,6 +113,7 @@ def dependency_status():
         "OpenCV": "cv2",
         "NumPy": "numpy",
         "Indra OCR": "indra_ocr",
+        "CPU/RAM monitor (psutil)": "psutil",
     }
     missing = [label for label, module in modules.items() if importlib.util.find_spec(module) is None]
     return {
@@ -628,6 +630,7 @@ class App(tk.Tk):
         self.live_proc = None
         self.live_log_handle = None
         self.recording_session = None
+        self.session_resource_monitor = None
         self.output_queue = queue.Queue()
         self.start_time = None
         self.timer_job = None
@@ -637,7 +640,7 @@ class App(tk.Tk):
         self.performance_mode = read_performance_mode()
         self.performance_mode_var = tk.StringVar(value='Light' if self.performance_mode == 'light' else 'Full')
         self.continuous_live_var = tk.BooleanVar(value=(
-            True if self.performance_mode == 'light' else live_settings["continuous"]))
+            True if self.performance_mode == 'light' else live_settings['continuous']))
         self.hotkey_var = tk.StringVar(value=live_settings["hotkey"] if live_settings["hotkey"] in HOTKEY_CHOICES else "Pause/Break")
         self.overlay_position_var = tk.StringVar(value=OVERLAY_POSITION_LABELS.get(live_settings["position"], "Custom"))
         self.result_display_seconds = float(live_settings["result_seconds"])
@@ -668,11 +671,13 @@ class App(tk.Tk):
         self.update_controller = UpdateController(self, self.update_button, HERE.parent)
 
         self.after(150, self.poll_output)
+        self.after(500, self.refresh_session_resource_status)
         self.after(250, self.refresh_system_status)
         self.after(300, self.refresh_capture_label)
         self.after(500, self.try_load_latest_result)
         self.after(650, self.configure_global_hotkey)
         self.after(800, self.monitor_continuous_live)
+        self.after(1900, self.refresh_background_status)
         self.after(100, self.poll_hotkey_event)
         self.after(1100, self.show_first_run_guide_if_needed)
 
@@ -714,9 +719,7 @@ class App(tk.Tk):
 
         self.system_label = ttk.Label(top, text="System check ...")
         self.system_label.pack(side="right", padx=(8, 0))
-        # GitHub builds embed their exact commit in VERSION.txt. The label is
-        # intentionally read at startup so an update shows the new version.
-        self.version_label = ttk.Label(top, text=installed_version_label(), style="Small.TLabel")
+        self.version_label = ttk.Label(top, text=installed_version_label(), style='Small.TLabel')
         self.version_label.pack(side="right", padx=(8, 0))
         self.system_button = ttk.Button(top, text="System check", command=self.show_system_check)
         self.system_button.pack(side="right")
@@ -760,6 +763,12 @@ class App(tk.Tk):
             style="Small.TLabel"
         )
         reminder.pack(anchor="w", pady=(8, 0))
+        self.background_alert_var = tk.StringVar(value=(
+            'Combat Log background: use solid opaque black (check starts in DDO).'))
+        self.background_alert_label = tk.Label(
+            control, textvariable=self.background_alert_var,
+            fg='#a36c12', anchor='w', justify='left', font=('Segoe UI', 9, 'bold'))
+        self.background_alert_label.pack(anchor='w', fill='x', pady=(4, 0))
 
         row2 = ttk.Frame(control)
         row2.pack(fill="x", pady=(12, 0))
@@ -887,7 +896,7 @@ class App(tk.Tk):
             style="Small.TLabel"
         ).pack(side="left")
 
-        # Both modes capture the complete configured Combat Log rectangle.
+        # One GUI, two modes. Never reduce Combat Log width or OCR accuracy.
         mode_row = ttk.Frame(control)
         mode_row.pack(fill='x', pady=(9, 0))
         ttk.Label(mode_row, text='Performance mode:').pack(side='left')
@@ -898,6 +907,11 @@ class App(tk.Tk):
         self.performance_combo.bind('<<ComboboxSelected>>', self.on_performance_mode_changed)
         self.performance_details = ttk.Label(mode_row, text='', style='Small.TLabel')
         self.performance_details.pack(side='left', fill='x', expand=True)
+
+        # Resource comparison uses whole process tree, not just the OCR helper.
+        self.resource_status_var = tk.StringVar(value='CPU/RAM: measured while recording (GUI + OCR + recorder + FFmpeg).')
+        ttk.Label(control, textvariable=self.resource_status_var, style='Small.TLabel').pack(
+            anchor='w', pady=(7, 0))
 
         # Progress line
         prog = ttk.Frame(outer)
@@ -2418,7 +2432,7 @@ class App(tk.Tk):
         self.set_busy(True, "Installing Python packages ...")
         cmd = [
             sys.executable, "-m", "pip", "install",
-            "mss", "opencv-python", "numpy", "indra-ocr"
+            "mss", "opencv-python", "numpy", "indra-ocr", "psutil"
         ]
         self.start_subprocess(cmd, "install", stdin_pipe=False)
 
@@ -2477,6 +2491,54 @@ class App(tk.Tk):
                 proc.stdin.flush()
                 return True
         except Exception:
+            pass
+        return False
+
+    def refresh_background_status(self):
+        """Show live quality info without activating/stealing focus from DDO."""
+        try:
+            path = HERE / 'live_background_status.json'
+            active = self.live_proc is not None and self.live_proc.poll() is None
+            if active and path.exists():
+                data = json.loads(path.read_text(encoding='utf-8'))
+                # An older process may have left a stale status file.
+                fresh = time.time() - float(data.get('wall_epoch', 0)) < 600
+                state = data.get('state') if fresh else 'unknown'
+            else:
+                state = 'unknown'
+            if state == 'warning':
+                self.background_alert_var.set(
+                    'WARNING: Combat Log background is NOT solid black. '
+                    'Set DDO chat background to opaque black; results may be 0 or incomplete.')
+                self.background_alert_label.config(fg='#b22222')
+            elif state == 'black':
+                self.background_alert_var.set('Combat Log background: black - live check OK.')
+                self.background_alert_label.config(fg='#26713a')
+            else:
+                self.background_alert_var.set(
+                    'Combat Log background: set to solid opaque black; '
+                    'checking when DDO is in the foreground.')
+                self.background_alert_label.config(fg='#a36c12')
+        except Exception:
+            pass
+        self.after(2000, self.refresh_background_status)
+
+    def warn_if_session_background_nonblack(self, session):
+        """Warning is advisory, never prevents Replay/Reanalyze."""
+        try:
+            report = inspect_saved_background(session)
+            if report.get('status') == 'warning':
+                self.background_alert_var.set(
+                    'WARNING: saved Combat Log background is not black; analysis may show 0 damage.')
+                self.background_alert_label.config(fg='#b22222')
+                messagebox.showwarning(
+                    'Combat Log background warning',
+                    WARNING_TEXT + '\n\nThis session was recorded with a problematic '
+                    'background. Replay/Reanalyze will still run, but a zero '
+                    'or incomplete result is not trustworthy.')
+                return True
+        except Exception:
+            # Cannot examine some old recordings; do not block analysis.
             pass
         return False
 
@@ -2647,6 +2709,69 @@ class App(tk.Tk):
 
     # -------------------------- subprocess engine --------------------------
 
+    def start_session_resource_monitor(self):
+        """Record CPU/RAM of the GUI plus its children during one combat session.
+
+        This is separate from the existing OCR-helper-only resource tracker.
+        Measurement failures never stop DDO capture or damage parsing.
+        """
+        if self.recording_session is None or self.session_resource_monitor is not None:
+            return
+        try:
+            from session_resource_monitor import SessionResourceMonitor
+            cfg = json.loads(CONFIG.read_text(encoding='utf-8'))
+            ocr_thread_setting = cfg.get('live_dps', {}).get('indra_threads', 'auto')
+            effective_threads = int(resolve_indra_threads(ocr_thread_setting))
+            if self.performance_mode == 'light':
+                effective_threads = min(2, effective_threads)
+            tracker = SessionResourceMonitor(
+                self.recording_session,
+                gui_pid=os.getpid(),
+                live_pid=(self.live_proc.pid if self.live_proc is not None else None),
+                recorder_pid=(self.proc.pid if self.proc is not None else None),
+                performance_mode=self.performance_mode,
+                capture_fps=(0 if self.performance_mode == 'light' else int(cfg.get('capture_fps', 30))),
+                tracking_fps=(20 if self.performance_mode == 'light' else int(
+                    cfg.get('live_dps', {}).get('tracking_fps', cfg.get('capture_fps', 30)))),
+                ocr_threads=effective_threads,
+                interval=0.25,
+            )
+            tracker.start()
+            self.session_resource_monitor = tracker
+            self.resource_status_var.set('CPU/RAM: collecting all analyzer processes every 250 ms ...')
+        except Exception as exc:
+            self.resource_status_var.set(f'CPU/RAM measurement unavailable: {type(exc).__name__}')
+            try:
+                (self.recording_session / 'python_resource_monitor_error.txt').write_text(
+                    f'{type(exc).__name__}: {exc}\n', encoding='utf-8')
+            except OSError:
+                pass
+
+    def finish_session_resource_monitor(self):
+        tracker = self.session_resource_monitor
+        self.session_resource_monitor = None
+        if tracker is None:
+            return
+        summary = tracker.stop()
+        if summary:
+            self.resource_status_var.set(
+                f"Recorded CPU: mean {summary['mean_cpu_cores']:.2f}, "
+                f"P95 {summary['p95_cpu_cores']:.2f}, max {summary['peak_cpu_cores']:.2f} cores "
+                f"| peak RAM {summary['peak_ram_mib']:.0f} MiB")
+        elif tracker.error:
+            self.resource_status_var.set('CPU/RAM measurement error; see session log')
+
+    def refresh_session_resource_status(self):
+        tracker = self.session_resource_monitor
+        if tracker is not None:
+            sample = tracker.snapshot()
+            if sample is not None:
+                self.resource_status_var.set(
+                    f"Recording CPU (all processes): {sample['cpu_cores_total']:.2f} cores "
+                    f"| RAM: {sample['ram_mib_total']:.0f} MiB "
+                    f"| processes: {sample['process_count']}")
+        self.after(500, self.refresh_session_resource_status)
+
     def start_subprocess(self, cmd, kind, stdin_pipe=False):
         if self.proc is not None:
             raise RuntimeError("A process is already running.")
@@ -2742,6 +2867,7 @@ class App(tk.Tk):
                         self.send_live_command(f"START_SESSION|{self.recording_session}")
                 else:
                     self.launch_live_estimator()
+                self.start_session_resource_monitor()
                 self._beep(1250, 90)
                 self.stop_btn.config(state="normal")
                 self.set_status('Recording (LIGHT)' if self.performance_mode == 'light' else 'Recording (FULL)', '#b22222')
@@ -2914,6 +3040,9 @@ class App(tk.Tk):
                 self.set_status("Recording startup error", "#b22222")
 
     def handle_process_done(self, kind, code):
+        if kind == 'record':
+            # Also save measurements when the recorder crashes or is cancelled.
+            self.finish_session_resource_monitor()
         proc = self.proc
         self.proc = None
         self.proc_kind = None
@@ -3013,8 +3142,8 @@ class App(tk.Tk):
                     if _source == 'live_ocr_light':
                         self.set_status('Light Mode: live OCR report complete', '#2e8b57')
                         self.overview_note.config(text=(
-                            'Light Mode recorded no FFV1 video. This report is based only on live OCR; '
-                            'Reanalyze (FFV1) and Replay Live are unavailable. Saved OCR can be rebuilt.'))
+                            'Light Mode used no FFV1 video. This report is based only on live OCR; '
+                            'Reanalyze and Replay Live are unavailable for this session.'))
                     elif _source == 'live_ocr_fast':
                         self.set_status('Fast analysis (live OCR)', '#2e8b57')
                         self.overview_note.config(text=(
@@ -3032,8 +3161,20 @@ class App(tk.Tk):
                     self.send_live_command(f"RESULT|{result_dps:.6f}|{self.result_display_seconds:.1f}")
                 self._beep(1450, 110, repeat=2)
 
+                background_warning = False
+                try:
+                    quality = json.loads((self.current_session / 'combat_log_background_check.json').read_text(encoding='utf-8'))
+                    background_warning = quality.get('status') == 'warning'
+                except Exception:
+                    pass
+                if background_warning:
+                    self.background_alert_var.set(
+                        'WARNING: saved Combat Log background is not black; damage may be incomplete or 0.')
+                    self.background_alert_label.config(fg='#b22222')
+                    self.set_status('Background warning - results may be incomplete', '#b22222')
+                    self.overview_note.config(text=WARNING_TEXT)
                 should_warn, details = self.detect_no_combat_log_activity(self.current_session)
-                if should_warn:
+                if should_warn and not background_warning:
                     self.set_status("No Combat Log activity detected", "#c98b16")
                     if not background:
                         messagebox.showwarning(
@@ -3110,7 +3251,14 @@ class App(tk.Tk):
                         "This replay checks live reconstruction/OCR/parser correctness on the saved capture. "
                         "It is not a real-time throughput test; the offline OCR queue waits instead of dropping lines.",
                     ])
-                    messagebox.showinfo("Replay live test", "\n".join(lines))
+                    quality = data.get('combat_log_background') or {}
+                    if quality.get('status') == 'warning':
+                        lines.extend(['', 'WARNING: Non-black/transparent Combat Log background detected.',
+                                      'Replay may return zero or incomplete damage. See replay_background_check.json.'])
+                        self.set_status('Replay: background warning', '#b22222')
+                        messagebox.showwarning('Replay live test - background warning', '\n'.join(lines))
+                    else:
+                        messagebox.showinfo("Replay live test", "\n".join(lines))
                 except Exception as e:
                     messagebox.showwarning(
                         "Replay live test",
@@ -3332,9 +3480,10 @@ class App(tk.Tk):
             self.continuous_live_var.set(True)
             self.continuous_check.config(state='disabled')
             self.ocr_threads_combo.config(state='disabled')
-        elif self.proc is None:
-            self.continuous_check.config(state='normal')
-            self.ocr_threads_combo.config(state='readonly')
+        else:
+            if self.proc is None:
+                self.continuous_check.config(state='normal')
+                self.ocr_threads_combo.config(state='readonly')
 
     def on_performance_mode_changed(self, _event=None):
         if self.proc is not None:
@@ -3483,7 +3632,8 @@ class App(tk.Tk):
         self.set_status("Preparing recorder...", "#c98b16")
         self.set_busy(True, "Preparing recorder before switching to DDO ...")
 
-        # Full records FFV1; Light only records a clock. Live OCR is sole capture.
+        # Full: independent FFV1 recorder. Light: clock-only recorder, with
+        # the persistent live OCR helper as the sole screen reader.
         if self.performance_mode == 'light' and (
                 self.live_proc is None or self.live_proc.poll() is not None):
             self.set_busy(False, 'Live OCR failed to start')
@@ -3519,6 +3669,8 @@ class App(tk.Tk):
         else:
             self.stop_live_estimator()
         self._beep(760, 100)
+        # Stop CPU sampling at the user's Stop boundary (not after analysis).
+        self.finish_session_resource_monitor()
 
         try:
             if self.proc.stdin:
@@ -3540,6 +3692,8 @@ class App(tk.Tk):
         cmd = [sys.executable, str(HERE / "process_latest.py"),
                "--prefer-live" if prefer_live else "--full-post"]
         if prefer_live and (self.performance_mode == 'light' or light_session):
+            # Old PCs can need time to finish queued Indra work after Stop.
+            # Without video there must never be a silent FFV1 fallback.
             cmd.extend(['--light', '--live-wait', '45'])
         self.start_subprocess(cmd, "analyze", stdin_pipe=False)
 
@@ -3569,6 +3723,7 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Reanalysis", f"Could not select the session for reanalysis:\n\n{e}")
             return
+        self.warn_if_session_background_nonblack(session)
         self.current_session = session
         self.detail_label.config(text=session.name)
         self.analysis_background = False
@@ -3600,6 +3755,7 @@ class App(tk.Tk):
             messagebox.showerror("System not ready", "Run System check first.")
             return
 
+        self.warn_if_session_background_nonblack(session)
         self.current_session = session
         self.detail_label.config(text=session.name)
         self.analysis_background = False
@@ -4329,6 +4485,7 @@ class App(tk.Tk):
                 "A recording or analysis is currently running. Do you really want to exit?"
             ):
                 return
+        self.finish_session_resource_monitor()
         try:
             self.hotkey_manager.stop()
         except Exception:

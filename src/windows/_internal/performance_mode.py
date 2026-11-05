@@ -1,4 +1,9 @@
-"""Full and Light profiles. Do not crop OCR input or change parsing rules."""
+"""Performance profiles shared by the GUI, live OCR and report generator.
+
+FULL retains the original independent lossless FFV1 recorder and post analysis.
+LIGHT keeps the same OCR and parsing logic but omits the video recorder.
+The selected capture rectangle and text-recognition rules are NEVER shrunk.
+"""
 from __future__ import annotations
 
 import ctypes
@@ -14,8 +19,8 @@ MODES = ('full', 'light')
 
 
 def mode_from_config(cfg):
-    value = str((cfg or {}).get('performance', {}).get('mode', 'full')).lower()
-    return value if value in MODES else 'full'
+    value = str((cfg or {}).get('performance', {}).get('mode', 'light')).lower()
+    return value if value in MODES else 'light'
 
 
 def scan_rate(cfg):
@@ -29,6 +34,7 @@ def ocr_threads(cfg, resolver):
 
 
 def current_rss_bytes():
+    """Live OCR helper's working set; no optional psutil dependency."""
     if os.name == 'nt':
         try:
             class PMC(ctypes.Structure):
@@ -48,6 +54,7 @@ def current_rss_bytes():
                 return int(mem.WorkingSetSize)
         except (AttributeError, OSError, ValueError):
             return None
+    # Linux-only development/simulation support.
     try:
         pages = int(Path('/proc/self/statm').read_text().split()[1])
         return pages * os.sysconf('SC_PAGE_SIZE')
@@ -56,7 +63,7 @@ def current_rss_bytes():
 
 
 class LiveResourceTracker:
-    """Measure only this Live OCR helper; DDO and FFmpeg are not measured."""
+    """Measure only THIS Live OCR process, not DDO or Windows as a whole."""
     def __init__(self):
         self.cpu_start = time.process_time()
         self.wall_start = time.monotonic()
@@ -75,7 +82,7 @@ class LiveResourceTracker:
         elapsed = max(0.001, time.monotonic() - self.wall_start)
         cpu = max(0.0, time.process_time() - self.cpu_start)
         return {
-            'scope': 'Live OCR helper only; excludes DDO, GUI, FFmpeg and OS activity',
+            'scope': 'Live OCR helper process only; excludes DDO, GUI, FFmpeg and OS activity',
             'mode': mode,
             'wall_seconds': round(elapsed, 4),
             'process_cpu_seconds': round(cpu, 4),
@@ -91,6 +98,7 @@ class LiveResourceTracker:
 
 
 def comparison_summary(session):
+    """Small comparable summary, after the fast report has been generated."""
     session = Path(session)
     def load_json(name):
         try:
@@ -115,7 +123,8 @@ def comparison_summary(session):
         video_bytes = path.stat().st_size
     except OSError:
         video_bytes = 0
-
+    # The analysis summary intentionally does not duplicate raw event counts.
+    # Count them from the authoritative CSVs rather than guessing field names.
     def count_csv(name, predicate=None):
         try:
             with (session / name).open('r', encoding='utf-8', newline='') as stream:
@@ -123,7 +132,6 @@ def comparison_summary(session):
                 return sum(1 for item in rows if predicate is None or predicate(item))
         except (OSError, csv.Error):
             return None
-
     outgoing_events = count_csv('damage_events.csv', lambda r: r.get('event') == 'damage_dealt')
     attacks_count = count_csv('attack_events.csv', lambda r: r.get('event') == 'attack')
     confirms_count = count_csv('attack_events.csv', lambda r: r.get('event') != 'attack')
@@ -151,7 +159,7 @@ def comparison_summary(session):
         'live_cpu_seconds': live.get('process_cpu_seconds'),
         'live_average_cpu_one_core_percent': live.get('average_cpu_one_core_percent'),
         'live_sampled_peak_working_set_mb': live.get('sampled_peak_working_set_mb'),
-        'note': 'Metrics measure OCR helper only. Compare similar-length fights and check target HP.',
+        'note': 'CPU and memory are only the Live OCR helper; use Task Manager for total DDO+Analyzer+FFmpeg load. Separate fights are not identical workloads.',
     }
     (session / 'performance_comparison.json').write_text(json.dumps(data, indent=2), encoding='utf-8')
     return data

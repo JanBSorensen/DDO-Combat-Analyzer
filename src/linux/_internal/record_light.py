@@ -1,4 +1,9 @@
-"""Minimal Light Mode session recorder: no capture loop, FFmpeg or video."""
+"""Light Mode's minimal session clock: NO screen capture, NO video, NO FFmpeg.
+
+The continuous live helper is the ONLY screen reader. We preserve the same GUI
+session handshake used by the full recorder, so all existing stop/fast-report
+logic can operate without a second capture process.
+"""
 from __future__ import annotations
 
 import csv
@@ -7,12 +12,14 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
 from performance_mode import mode_from_config, scan_rate
 
 HERE = Path(__file__).resolve().parent
 
 
 def create_session(config, now=None):
+    """Make a unique session without silently overwriting an existing one."""
     now = now or datetime.now()
     stem = 'combat_' + now.strftime('%Y%m%d_%H%M%S')
     session = HERE / stem
@@ -35,6 +42,7 @@ def main():
     print('RECORDER_READY', flush=True)
     cmd = sys.stdin.readline().strip().upper()
     if cmd != 'START':
+        # Never leave misleading incomplete session folders behind.
         for f in session.iterdir():
             f.unlink()
         session.rmdir()
@@ -49,6 +57,7 @@ def main():
         'video_recording': False,
     }, indent=2), encoding='utf-8')
     print('CAPTURE_STARTED', flush=True)
+    # No recording loop or duplicate MSS grabs; wait for the GUI's STOP.
     while True:
         command = sys.stdin.readline()
         if not command or command.strip().upper() == 'STOP':
@@ -68,7 +77,7 @@ def main():
         f'Elapsed seconds: {duration:.3f}\n'
         'Video size: 0.0 MB\n'
         'FFv1 video: disabled\n'
-        'Reanalyze (FFV1) and Replay Live are unavailable for this session.\n',
+        'Reanalyze and Replay Live are unavailable for this session.\n',
         encoding='utf-8')
     (HERE / 'LATEST_SESSION.txt').write_text(str(session.resolve()), encoding='utf-8')
     print(f'Recording saved: {session}', flush=True)

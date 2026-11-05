@@ -3,3 +3,4 @@ opencv-python
 numpy
 indra-ocr
 python-xlib
+psutil>=5.9
