@@ -15,6 +15,7 @@ import threading
 import time
 
 import numpy as np
+from image_file_io import read_gray_image
 
 WARNING_TEXT = (
     'Combat Log background does not appear solid black. Set DDO Combat Log '
@@ -143,7 +144,7 @@ def inspect_saved_background(session, max_frames=12):
     baseline = session / 'baseline_gray.png'
     if baseline.is_file():
         try:
-            sample = classify_background(cv2.imread(str(baseline), cv2.IMREAD_GRAYSCALE))
+            sample = classify_background(read_gray_image(baseline))
             samples.append(dict(source='baseline_gray.png', **sample.as_dict()))
         except Exception as exc:
             errors.append('baseline: ' + str(exc))

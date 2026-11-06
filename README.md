@@ -2,7 +2,7 @@
 
 DDO Combat Analyzer is a non-invasive combat analysis tool for **Dungeons & Dragons Online (DDO)**.
 
-It reads the visible Combat Log from screen capture and provides live and post-combat analysis using **Indra OCR**.
+It reads the visible Combat Log from screen capture and provides live and post-combat analysis using **Indra OCR**. **Indra Direct ONNX and Light mode** are now the defaults for both new and updated installations.
 
 ## Downloads
 
@@ -51,7 +51,8 @@ cover the live OCR helper, not DDO, GUI, FFmpeg or the entire computer.
 
 The current code uses:
 
-- Indra OCR
+- Indra Direct (recognition-only ONNX, default), or Indra Full (fallback)
+- ONNX Runtime
 - MSS
 - OpenCV
 - NumPy
@@ -97,4 +98,4 @@ This is an independent community project and is not affiliated with or endorsed 
 
 ### November 2026: Light default and quality safeguards
 
-Light mode is now the default for new Windows and Linux installations (20 FPS, up to 2 OCR threads). Full remains available for FFV1 video, independent Reanalyze and Replay Live; existing mode preferences are preserved. An **opaque black DDO Combat Log background is required** for reliable OCR. The analyzer warns about nonblack backgrounds and improves wrapped damage/sneak attack parsing, B/8 numeric OCR verification and event coverage diagnostics.
+Light and Indra Direct are selected by default for both new and upgraded Windows and Linux installations (20 FPS, up to 2 OCR threads). A one-time migration updates these two preferences without touching capture area, other settings or saved sessions; subsequent user selections are preserved. Full remains available for FFV1 video, independent Reanalyze and Replay Live. An **opaque black DDO Combat Log background is required** for reliable OCR. The analyzer warns about nonblack backgrounds and improves wrapped damage/sneak attack parsing, B/8 numeric OCR verification and event coverage diagnostics.

@@ -113,6 +113,22 @@ def main():
         os.chdir(HERE)
         if not acquire_single_instance():
             return
+        from settings_migration import apply_release_defaults
+        apply_release_defaults(HERE / 'config.json')
+        from direct_indra_onnx import availability as direct_ocr_availability
+        if not direct_ocr_availability()[0]:
+            # Existing releases keep config and Python dependencies; auto-install
+            # the new Direct engine asynchronously before the first recording.
+            setup_log = (HERE / 'direct_setup.log').open('a', encoding='utf-8')
+            try:
+                subprocess.Popen(
+                    [sys.executable, str(HERE / 'prepare_direct_ocr.py'), '--install-runtime'],
+                    cwd=str(HERE), stdin=subprocess.DEVNULL,
+                    stdout=setup_log, stderr=subprocess.STDOUT,
+                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0) if os.name == 'nt' else 0,
+                    start_new_session=(os.name != 'nt'))
+            finally:
+                setup_log.close()
         runpy.run_path(str(APP), run_name="__main__")
 
     except BaseException:

@@ -76,20 +76,28 @@ class NumericGuard:
         output = []
         idx = int(lineno) - 1
         if self.converter is not None and 0 <= idx < len(self.crops):
-            import cv2
-            from process_latest import preprocess_line_indra, preprocess_line
             crop = self.crops[idx]
-            variants = [preprocess_line_indra(crop), preprocess_line(crop)]
-            for img in variants:
+            if hasattr(self.converter, 'recognize_variants'):
                 t0 = time.perf_counter()
                 try:
-                    page = self.converter.ocr(img)
-                    txt = ' '.join(str(getattr(z, 'text', '') or '')
-                                   for z in (getattr(page, 'lines', []) or []))
-                    output.append(re.sub(r'\s+', ' ', txt).strip())
+                    output = [re.sub(r'\s+', ' ', txt).strip()
+                              for txt in self.converter.recognize_variants(crop)]
                 except Exception:
-                    output.append('')
+                    output = []
                 self.ocr_seconds += time.perf_counter() - t0
+            else:
+                from process_latest import preprocess_line_indra, preprocess_line
+                variants = [preprocess_line_indra(crop), preprocess_line(crop)]
+                for img in variants:
+                    t0 = time.perf_counter()
+                    try:
+                        page = self.converter.ocr(img)
+                        txt = ' '.join(str(getattr(z, 'text', '') or '')
+                                       for z in (getattr(page, 'lines', []) or []))
+                        output.append(re.sub(r'\s+', ' ', txt).strip())
+                    except Exception:
+                        output.append('')
+                    self.ocr_seconds += time.perf_counter() - t0
         self._recheck_cache[lineno] = output
         return output
 

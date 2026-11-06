@@ -49,7 +49,7 @@
     "overlay_height": 190,
     "overlay_margin": 20,
     "overlay_position": "top_center",
-    "ocr_engine": "indra",
+    "ocr_engine": "indra_direct",
     "ocr_batch_max_lines": 12,
     "indra_threads": "auto",
     "continuous_mode": true,
@@ -65,5 +65,8 @@
   },
   "performance": {
     "mode": "light"
+  },
+  "release_migrations": {
+    "light_direct_defaults_20261106": true
   }
 }

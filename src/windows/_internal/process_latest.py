@@ -13,15 +13,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-try:
-    import indra_ocr
-except Exception:
-    indra_ocr = None
+# Indra Full imports lazily when explicitly selected.
 
 HERE = Path(__file__).resolve().parent
 CONFIG_PATH = HERE / "config.json"
 
 from cpu_utils import physical_core_count, resolve_indra_threads
+from direct_indra_onnx import DirectIndraRecognizer
 from post_numeric_guard import NumericGuard
 from attack_mode_audit import save as save_attack_audit
 from focus_resume_guard import recover_append_rows
@@ -1062,7 +1060,7 @@ ATTACK_RE = re.compile(
 
 CONFIRM_RE = re.compile(
     rf"\bYou\s+roll\s+to\s+confirm\s+a\s+critical\s+on\s+"
-    rf"(?P<target>.+?)\.\s+You\s+roll\s+a\s+"
+    rf"(?P<target>.+?)[.,]\s+You\s+roll\s+a\s+"
     rf"(?P<roll>{NUM_TOKEN})"
     rf"(?:\s*\(\+(?P<bonus>{NUM_TOKEN})\))?\s*:\s*"
     rf"(?P<result>.+)$",
@@ -2609,14 +2607,14 @@ def main():
         ):
             if key in current_analysis:
                 session_analysis[key] = current_analysis[key]
+        cfg.setdefault("live_dps", {})["ocr_engine"] = current_cfg.get("live_dps", {}).get("ocr_engine", "indra_direct")
         line_height_settings_source = "current_config"
     except Exception:
         line_height_settings_source = "session_config_fallback"
 
-    if indra_ocr is None:
-        print("Indra OCR is not installed or could not be imported.")
-        print("Run SETUP DDO Combat Analyzer.cmd.")
-        raise SystemExit(2)
+    ocr_engine = str(cfg.get('live_dps', {}).get('ocr_engine', 'indra_direct')).strip().lower()
+    if ocr_engine not in ('indra', 'indra_direct'):
+        raise ValueError('Unrecognized OCR engine in config')
 
     ffmpeg = find_ffmpeg(str(cfg.get("ffmpeg_path", "")).strip())
     if not ffmpeg:
@@ -3262,7 +3260,7 @@ def main():
     timing_details["reconstruction_setup_teardown_overhead"] += f"; reconstruction_total={reconstruction_total:.6f}s"
 
     print(f"Visual reconstruction complete: {len(visual_lines)} new lines.")
-    print("Running Indra post-analysis OCR...")
+    print("Running independent post-analysis OCR: " + ocr_engine, flush=True)
 
     thread_setting = cfg.get("live_dps", {}).get("indra_threads", "auto")
     threads = resolve_indra_threads(thread_setting)
@@ -3271,7 +3269,11 @@ def main():
 
     model_load_t0 = time.perf_counter()
     try:
-        converter = indra_ocr.load(threads=threads, mode="ocr")
+        if ocr_engine == 'indra_direct':
+            converter = DirectIndraRecognizer(threads=threads)
+        else:
+            import indra_ocr
+            converter = indra_ocr.load(threads=threads, mode='ocr')
     except Exception as exc:
         print(f"Indra OCR could not be loaded: {type(exc).__name__}: {exc}")
         raise SystemExit(5)
@@ -3285,14 +3287,16 @@ def main():
     line_times = [meta[1] for meta in visual_line_meta]
     for start_i in range(0, len(visual_lines), batch_max):
         batch = visual_lines[start_i:start_i + batch_max]
-        batch_texts = ocr_indra_batch(converter, batch)
+        batch_texts = (converter.recognize_batch(batch) if ocr_engine == 'indra_direct'
+                       else ocr_indra_batch(converter, batch))
         texts[start_i:start_i + len(batch_texts)] = batch_texts
         done = min(start_i + len(batch), len(visual_lines))
         if done % (batch_max * 2) == 0 or done == len(visual_lines):
             print(f"PROGRESS|OCR|{done}|{max(1, len(visual_lines))}", flush=True)
 
     timings.append(("indra_ocr", time.perf_counter() - ocr_t0))
-    timing_details["indra_ocr"] = f"visual_lines={len(visual_lines)}; batch_max={batch_max}"
+    timing_details["indra_ocr"] = (f"engine={ocr_engine}; visual_lines={len(visual_lines)}; "
+                                    f"batch_max={batch_max}")
 
     log_write_t0 = time.perf_counter()
     log_path = session / "combat_log.txt"

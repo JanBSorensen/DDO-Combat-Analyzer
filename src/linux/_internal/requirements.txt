@@ -4,3 +4,4 @@ numpy
 indra-ocr
 python-xlib
 psutil>=5.9
+onnxruntime>=1.19,<2

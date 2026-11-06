@@ -34,6 +34,9 @@ jobs:
               for p in [*internal.glob('*.py'), *internal.glob('*.pyw')]:
                   ast.parse(p.read_text(encoding='utf-8'), filename=str(p))
               assert (internal / 'update_manager.py').is_file()
+              for required in ('direct_indra_onnx.py','prepare_direct_ocr.py',
+                               'image_file_io.py','settings_migration.py'):
+                  assert (internal / required).is_file(), (platform, required)
               assert (internal / 'performance_mode.py').is_file()
               assert (internal / 'record_light.py').is_file()
               assert (internal / 'capture_geometry.py').is_file()
@@ -43,11 +46,17 @@ jobs:
               assert (internal / 'session_resource_monitor.py').is_file()
               assert (Path('src') / platform / 'tests' / 'test_background_black.py').is_file()
               import json
-              assert json.loads((internal / 'config.json').read_text())['performance']['mode'] == 'light'
+              defaults = json.loads((internal / 'config.json').read_text())
+              assert defaults['performance']['mode'] == 'light'
+              assert defaults['live_dps']['ocr_engine'] == 'indra_direct'
+              assert defaults['release_migrations']['light_direct_defaults_20261106'] is True
+              assert 'onnxruntime' in (internal / 'requirements.txt').read_text()
               assert "'mode', 'light'" in (internal / 'performance_mode.py').read_text()
               assert 'visibility_guard.inspect(gray)' in (internal / 'live_overlay.py').read_text()
               assert 'def _preflight_capture(' in (internal / 'continuous_live.py').read_text()
               assert "self.performance_combo" in (internal / 'DDO Combat Analyzer.pyw').read_text()
+              assert "self.ocr_engine_combo" in (internal / 'DDO Combat Analyzer.pyw').read_text()
+              assert "apply_release_defaults" in (internal / 'launch_gui.py').read_text()
               assert "--light" in (internal / 'process_latest.py').read_text()
               assert "LiveResourceTracker" in (internal / 'continuous_live.py').read_text()
               assert 'UpdateController(' in (internal / 'DDO Combat Analyzer.pyw').read_text()
@@ -55,7 +64,7 @@ jobs:
               print(platform, 'Python syntax and updater UI OK')
           PY
 
-      - name: Run 16 parser, numeric and background regression tests on both platforms
+      - name: Run parser, Direct OCR, migration and background tests on both platforms
         shell: bash
         run: |
           set -euo pipefail
@@ -80,6 +89,9 @@ jobs:
             test -s "dist/staging/$platform/_internal/update_manager.py"
             test -s "dist/staging/$platform/_internal/performance_mode.py"
             test -s "dist/staging/$platform/_internal/record_light.py"
+            test -s "dist/staging/$platform/_internal/direct_indra_onnx.py"
+            test -s "dist/staging/$platform/_internal/prepare_direct_ocr.py"
+            test -s "dist/staging/$platform/_internal/settings_migration.py"
             test -s "dist/staging/$platform/LICENSE"
             test ! -e "dist/staging/$platform/LOCAL_TEST_VERSION.txt"
           done
@@ -114,10 +126,10 @@ jobs:
           cat > dist/RELEASE_NOTES.md <<EOF
           DDO Combat Analyzer for Windows and Linux (X11).
 
-          - **New:** Full/Light selector in the same GUI on both platforms; Full retains lossless FFV1 video, independent post reanalysis and Replay Live.
+          - **New:** Indra Direct ONNX recognition-only OCR is the default on Windows and Linux, with Indra Full still available as fallback.
           - **Light:** 20-FPS OCR tracking, at most 2 OCR threads, no FFmpeg/video capture or redundant screenshot diagnostics. Saved live OCR supports rebuilding reports, not independent video reanalysis.
-          - **Default:** Light on NEW installations; saved Full/Light preferences are preserved. Full is still available for independent FFV1 video reanalysis and replay.
-          - **Fixed:** Wrapped 2-4-line damage/sneak attacks, cautious B/8 OCR verification, numeric guard, damage-parse coverage and black-background quality warnings (live and saved Full video).
+          - **Defaults on NEW and UPDATED installations:** Light and Indra Direct. A one-time migration applies these settings to saved configurations, retaining capture area, other settings and session history. Future user changes are preserved.
+          - **Fixed:** Critical confirmations with a comma or period after the target are now parsed. 39/39 confirmations restored in a real Direct session without changing 258 damage events or 1,112,771 damage. Existing wrapped damage, B/8, background and numeric-guard fixes remain.
           - **Capture sync:** Live OCR refreshes the exact Combat Log rectangle before each Full/Light recording and verifies it against the recorder; mismatches abort live collection instead of silently corrupting DPS.
           - **Scroll recovery:** Confident prior-frame alignment recovers scrolls missed by stale anchors; long unresolved stalls are diagnosed rather than guessed.
           - **Zoning protection:** Detects loading/hidden Combat Log, suspends OCR while hidden and re-baselines on return to avoid re-counting old damage. Rolling DPS still decays after the selected inactivity window.
@@ -125,8 +137,8 @@ jobs:
           - **Testing:** Local simulated zoning and live/replay integration passed; a longer real in-game zoning-after-damage regression test is still recommended.
           - **Windows:** Download DDO-Combat-Analyzer-Windows.zip, extract it, run SETUP DDO Combat Analyzer.cmd once, then START DDO Combat Analyzer.cmd.
           - **Linux (Mint/Cinnamon X11):** Download DDO-Combat-Analyzer-Linux.zip, extract it, run bash 'SETUP DDO Combat Analyzer.sh' once, then ./START_DDO_COMBAT_ANALYZER.sh.
-          - **Data safety:** Updating keeps existing config.json, capture area, OCR/Python installations and combat sessions.
-          - **Verification:** Windows Full and Light have matched observed target HP in real sessions; automated parser/background regression tests on both platforms. Linux native X11 in-game validation is still recommended.
+          - **Setup/upgrade:** Windows/Linux SETUP installs ONNX Runtime and verifies the separately downloaded pinned Indra v1.1.0 rec.onnx model. Auto-upgraded installations bootstrap missing Direct requirements in the background without deleting configurations or combat sessions.
+          - **Verification:** Windows Light + Direct recovered 258/258 damage events and matched target HP within 1 (float32 display precision). Parser, Direct preprocessing and one-time migration tests are included for both platforms. Linux X11 in-game validation is still recommended.
           - Both ZIPs include the application source and license notices. Third-party dependencies and Indra model weights have separate licenses.
           - Source commit: ${GITHUB_SHA}.
           EOF

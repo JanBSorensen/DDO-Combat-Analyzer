@@ -19,6 +19,7 @@ in the repository**.
 | NumPy (`numpy`) | BSD-3-Clause (with separately licensed components in some binary wheels) | [NumPy license](https://numpy.org/doc/stable/license.html) |
 | OpenCV (`cv2`) | Apache-2.0 for OpenCV 4.5.0+; the `opencv-python` packaging code is MIT; wheels may include additional licensed components | [OpenCV license](https://opencv.org/license/), [opencv-python distribution notes](https://pypi.org/project/opencv-python/) |
 | Indra OCR Python code (`indra-ocr`) | Apache-2.0 | [Indra source](https://github.com/datalab-to/indra) |
+| ONNX Runtime (`onnxruntime`), recognition-only Direct inference | MIT | [ONNX Runtime](https://github.com/microsoft/onnxruntime) |
 | **Indra OCR pretrained model weights** | **Modified OpenRAIL-M** (additional usage, commercial and competition-related conditions) | [Indra model license](https://huggingface.co/datalab-to/indra-ocr/blob/main/LICENSE) and [usage description](https://github.com/datalab-to/indra#license) |
 | FFmpeg, external encoder/decoder | LGPL-2.1-or-later for the standard build, or GPL depending on included components and configuration. **Gyan's Windows FFmpeg builds are GPLv3.** | [FFmpeg licensing](https://ffmpeg.org/legal.html), [Gyan Windows builds](https://www.gyan.dev/ffmpeg/builds/) |
 | python-xlib (`python-xlib`), Linux X11 support | LGPL-2.1-or-later | [python-xlib](https://github.com/python-xlib/python-xlib) |

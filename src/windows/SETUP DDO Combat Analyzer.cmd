@@ -240,6 +240,20 @@ if errorlevel 1 (
 )
 echo.
 
+echo Installing Indra Direct ONNX recognition model...
+"!PYEXE!" -m pip install --upgrade "onnxruntime>=1.19,<2"
+if errorlevel 1 (
+    echo ERROR: ONNX Runtime installation failed.
+    pause
+    exit /b 8
+)
+"!PYEXE!" "%APPDIR%\prepare_direct_ocr.py"
+if errorlevel 1 (
+    echo ERROR: Indra Direct model installation failed.
+    pause
+    exit /b 9
+)
+
 echo [6/6] Verifying installation and saving Python paths...
 "!PYEXE!" -c "import tkinter, mss, cv2, numpy, indra_ocr, psutil; r=tkinter.Tk(); r.withdraw(); r.update(); r.destroy(); print('GUI prerequisites: OK')"
 if errorlevel 1 (

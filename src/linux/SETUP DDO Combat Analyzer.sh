@@ -35,6 +35,10 @@ python3 -m venv "$VENV"
 "$VENV/bin/python" -m pip install -r "$REQ"
 
 echo
+echo "Installing and validating Indra Direct ONNX recognition model..."
+"$VENV/bin/python" "$ROOT/_internal/prepare_direct_ocr.py"
+
+echo
 echo "Checking Python modules..."
 "$VENV/bin/python" - <<'PY'
 mods = [

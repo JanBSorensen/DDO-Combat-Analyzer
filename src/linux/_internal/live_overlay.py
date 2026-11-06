@@ -19,10 +19,7 @@ from pathlib import Path
 import cv2
 import mss
 import numpy as np
-try:
-    import indra_ocr
-except Exception:
-    indra_ocr = None
+# Indra Full loads lazily; Direct uses only the recognition ONNX model.
 import tkinter as tk
 
 HERE = Path(__file__).resolve().parent
@@ -30,6 +27,7 @@ CONFIG = HERE / "config.json"
 DEFAULT_LIVE_WINDOW_SECONDS = 15.0
 
 from cpu_utils import resolve_indra_threads
+from direct_indra_onnx import DirectIndraRecognizer
 from performance_mode import mode_from_config, scan_rate, ocr_threads
 from live_ocr_log import new_row, write_log
 from live_input_diagnostics import LiveInputDiagnostics
@@ -861,10 +859,10 @@ class LiveEstimator:
         self.indra_threads_setting = self.live_cfg.get("indra_threads", "auto")
         self.indra_threads = ocr_threads(self.cfg, resolve_indra_threads)
         self.indra_converter = None
+        self.direct_recognizer = None
         self.ocr_engine_active = "starting"
-
-        if indra_ocr is None:
-            raise RuntimeError("Indra OCR is not installed. Run SETUP DDO Combat Analyzer.sh.")
+        if self.ocr_engine_preference not in ('indra', 'indra_direct'):
+            raise ValueError('Unknown OCR engine; choose Indra Full or Direct')
 
         self.clock_path = self.session / "recording_clock.json"
         self.stop_path = self.session / "live_stop.flag"
@@ -1184,13 +1182,20 @@ class LiveEstimator:
                   note='All OCR outputs from captured line crops; dropped crops are counted separately.')
 
     def init_live_ocr_engine(self):
-        """Load the persistent Indra OCR model used by live DPS."""
-        if indra_ocr is None:
-            raise RuntimeError("Indra OCR is not installed.")
-        self.indra_converter = indra_ocr.load(threads=self.indra_threads, mode="ocr")
-        self.ocr_engine_active = "indra"
+        """Load the selected engine into the persistent OCR helper."""
+        if self.ocr_engine_preference == 'indra_direct':
+            self.direct_recognizer = DirectIndraRecognizer(threads=self.indra_threads)
+            self.indra_converter = None
+            self.ocr_engine_active = 'indra_direct'
+        else:
+            import indra_ocr
+            self.indra_converter = indra_ocr.load(threads=self.indra_threads, mode='ocr')
+            self.direct_recognizer = None
+            self.ocr_engine_active = 'indra'
 
     def ocr_indra_batch(self, items):
+        if self.direct_recognizer is not None:
+            return self.direct_recognizer.recognize_batch([item[1] for item in items])
         canvas, slots = build_indra_batch(items)
         if canvas is None:
             return [""] * len(items)
@@ -1246,6 +1251,8 @@ class LiveEstimator:
 
     def ocr_indra_single(self, crop):
         """OCR one line crop without batch neighbours for numeric verification."""
+        if self.direct_recognizer is not None:
+            return self.direct_recognizer.recognize_batch([crop])[0]
         return self._ocr_indra_prepared(preprocess_line_indra(crop))
 
     def ocr_indra_single_variants(self, crop):
@@ -1255,6 +1262,8 @@ class LiveEstimator:
         one thresholding path.  These variants are intentionally used only for
         suspicious numbers, so normal live OCR speed is unaffected.
         """
+        if self.direct_recognizer is not None:
+            return self.direct_recognizer.recognize_variants(crop)
         variants = [preprocess_line_indra(crop), preprocess_line(crop)]
         raw = cv2.copyMakeBorder(crop, 4, 4, 4, 4, cv2.BORDER_REPLICATE)
         raw = cv2.resize(raw, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
@@ -1275,7 +1284,14 @@ class LiveEstimator:
 
     def ocr_worker(self):
         self.write_status(ocr_worker_started=True, ocr_worker_finished=False)
-        self.init_live_ocr_engine()
+        try:
+            self.init_live_ocr_engine()
+        except Exception as exc:
+            self.write_status(ocr_worker_finished=True,
+                              worker_error=f'OCR initialization failed: {type(exc).__name__}: {exc}')
+            self.update_queue.put(('error', f'OCR initialization failed: {exc}'))
+            self.stop_event.set()
+            return
         with self.scan_path.open("w", newline="", encoding="utf-8") as scan_f:
             scan_w = csv.writer(scan_f)
             scan_w.writerow([

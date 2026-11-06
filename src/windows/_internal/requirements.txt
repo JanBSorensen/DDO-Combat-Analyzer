@@ -3,3 +3,4 @@ opencv-python
 numpy
 indra-ocr
 psutil>=5.9
+onnxruntime>=1.19,<2

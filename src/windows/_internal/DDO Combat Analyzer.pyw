@@ -48,6 +48,7 @@ from cpu_utils import physical_core_count, resolve_indra_threads
 from update_manager import UpdateController, local_revision
 from performance_mode import mode_from_config
 from combat_log_background import inspect_saved_background, WARNING_TEXT
+from direct_indra_onnx import availability as direct_ocr_availability
 
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 SW_RESTORE = 9
@@ -357,6 +358,7 @@ def read_live_user_settings():
         "window_seconds": float(live.get("rolling_window_seconds", 15.0)),
         "font_size": int(live.get("font_size", 24)),
         "indra_threads": live.get("indra_threads", "auto"),
+        "ocr_engine": live.get("ocr_engine", "indra_direct"),
     }
 
 
@@ -654,6 +656,11 @@ class App(tk.Tk):
         if initial_ocr_threads not in OCR_THREAD_CHOICES:
             initial_ocr_threads = "Auto"
         self.ocr_threads_var = tk.StringVar(value=initial_ocr_threads)
+        self.ocr_engine = str(live_settings.get('ocr_engine', 'indra_direct')).strip().lower()
+        if self.ocr_engine not in ('indra', 'indra_direct'):
+            self.ocr_engine = 'indra_direct'
+        self.ocr_engine_var = tk.StringVar(value=(
+            'Indra Direct (ONNX)' if self.ocr_engine == 'indra_direct' else 'Indra Full (original)'))
         self.detected_physical_cores = physical_core_count()
         self.graph_window_seconds = float(live_settings["window_seconds"])
         self.recording_started_by_hotkey = False
@@ -897,6 +904,16 @@ class App(tk.Tk):
         ).pack(side="left")
 
         # One GUI, two modes. Never reduce Combat Log width or OCR accuracy.
+        ocr_row = ttk.Frame(control)
+        ocr_row.pack(fill='x', pady=(7, 0))
+        ttk.Label(ocr_row, text='OCR engine:').pack(side='left')
+        self.ocr_engine_combo = ttk.Combobox(
+            ocr_row, textvariable=self.ocr_engine_var,
+            values=('Indra Direct (ONNX)', 'Indra Full (original)'),
+            width=23, state='readonly')
+        self.ocr_engine_combo.pack(side='left', padx=(6, 12))
+        self.ocr_engine_combo.bind('<<ComboboxSelected>>', self.on_ocr_engine_changed)
+
         mode_row = ttk.Frame(control)
         mode_row.pack(fill='x', pady=(9, 0))
         ttk.Label(mode_row, text='Performance mode:').pack(side='left')
@@ -2398,6 +2415,8 @@ class App(tk.Tk):
             missing.append("Python packages")
         if self.performance_mode == 'full' and not st["ffmpeg"]:
             missing.append("FFmpeg")
+        if self.ocr_engine == 'indra_direct' and not direct_ocr_availability()[0]:
+            missing.append("Direct ONNX (installing, or run SETUP)")
 
         if missing:
             self.system_label.config(text="Missing: " + ", ".join(missing) + " — run SETUP")
@@ -2552,6 +2571,8 @@ class App(tk.Tk):
     def ensure_continuous_live(self):
         if not self.continuous_live_var.get() or self.suppress_continuous_live:
             return
+        if self.ocr_engine == 'indra_direct' and not direct_ocr_availability()[0]:
+            return  # First launch can still be installing model/runtime.
         if self.live_proc is not None and self.live_proc.poll() is None:
             return
         st = dependency_status()
@@ -3447,6 +3468,7 @@ class App(tk.Tk):
         self.rolling_window_combo.config(state="disabled")
         self.overlay_font_size_combo.config(state="disabled")
         self.ocr_threads_combo.config(state="disabled")
+        self.ocr_engine_combo.config(state="disabled")
         self.overlay_position_combo.config(state="disabled")
         self.position_overlay_btn.config(state="disabled")
         self.continuous_check.config(state="disabled")
@@ -3464,6 +3486,7 @@ class App(tk.Tk):
         self.rolling_window_combo.config(state="readonly")
         self.overlay_font_size_combo.config(state="readonly")
         self.ocr_threads_combo.config(state="readonly")
+        self.ocr_engine_combo.config(state="readonly")
         self.overlay_position_combo.config(state="readonly")
         self.position_overlay_btn.config(state="normal")
         self.continuous_check.config(state="normal")
@@ -3484,6 +3507,35 @@ class App(tk.Tk):
             if self.proc is None:
                 self.continuous_check.config(state='normal')
                 self.ocr_threads_combo.config(state='readonly')
+
+    def on_ocr_engine_changed(self, _event=None):
+        if self.proc is not None:
+            self.ocr_engine_var.set('Indra Direct (ONNX)' if self.ocr_engine == 'indra_direct'
+                                    else 'Indra Full (original)')
+            return
+        requested = ('indra_direct' if self.ocr_engine_var.get() == 'Indra Direct (ONNX)'
+                     else 'indra')
+        if requested == self.ocr_engine:
+            return
+        if requested == 'indra_direct':
+            ready, details = direct_ocr_availability()
+            if not ready:
+                self.ocr_engine_var.set('Indra Full (original)')
+                messagebox.showerror('Direct ONNX unavailable', details)
+                return
+        previous = self.ocr_engine
+        try:
+            save_live_user_settings(ocr_engine=requested)
+            self.ocr_engine = requested
+            if self.continuous_live_var.get():
+                self.stop_continuous_live()
+                self.after(350, self.ensure_continuous_live)
+            self.refresh_system_status()
+        except Exception as exc:
+            self.ocr_engine = previous
+            self.ocr_engine_var.set('Indra Direct (ONNX)' if previous == 'indra_direct'
+                                    else 'Indra Full (original)')
+            messagebox.showerror('OCR engine', str(exc))
 
     def on_performance_mode_changed(self, _event=None):
         if self.proc is not None:

@@ -19,6 +19,7 @@ from combat_log_background import inspect_saved_background, save_background_repo
 from pathlib import Path
 
 import cv2
+from image_file_io import read_gray_image
 
 from live_overlay import (
     LiveEstimator,
@@ -346,7 +347,7 @@ def run_replay(session: Path):
     background_monitor = BackgroundMonitor(sample_seconds=2.0, confirm_samples=3)
     baseline = session / "baseline_gray.png"
     if baseline.exists():
-        prev_gray = cv2.imread(str(baseline), cv2.IMREAD_GRAYSCALE)
+        prev_gray = read_gray_image(baseline)
         if prev_gray is not None:
             prev_feat = fast_text_feature(prev_gray)
             prev_phase = best_grid_phase_from_feature(prev_feat, est.line_height)
