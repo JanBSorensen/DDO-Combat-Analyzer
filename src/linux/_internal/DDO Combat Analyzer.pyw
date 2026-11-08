@@ -46,6 +46,10 @@ def save_performance_mode(mode):
 from cpu_utils import physical_core_count, resolve_indra_threads
 from performance_mode import mode_from_config
 from combat_log_background import inspect_saved_background, WARNING_TEXT
+from crit_damage_metrics import load_or_build_crit_damage
+from attack_crit_integrity import (relink_attack_confirmations, assess_attack_integrity)
+from crit_roll_tables import (attack_d20_rows, confirmation_d20_rows, confirmation_summary,
+                              observed_confirmation_threshold)
 from direct_indra_onnx import availability as direct_ocr_availability
 from update_manager import UpdateController, local_revision
 
@@ -1320,8 +1324,14 @@ class App(tk.Tk):
         ]
         mob_attacks = [r for r in attack_rows if r.get("target") == target and r.get("event") != "confirm"]
         mob_confirms = [r for r in attack_rows if r.get("target") == target and r.get("event") == "confirm"]
+        mob_attacks, mob_confirms = relink_attack_confirmations(mob_attacks, mob_confirms)
         crit_row = next((r for r in crit_rows if r.get("target") == target), {})
         mob_mitigation = [r for r in mitigation_rows if r.get("target") == target]
+        try:
+            crit_damage_for_target = load_or_build_crit_damage(session).get(target, {})
+        except (OSError, ValueError, KeyError) as exc:
+            crit_damage_for_target = {}
+
 
         regular = sum(self._as_int(r.get("amount")) for r in outgoing if r.get("mode") == "regular")
         sneak = sum(self._as_int(r.get("amount")) for r in outgoing if r.get("mode") == "sneak")
@@ -1334,13 +1344,19 @@ class App(tk.Tk):
         incoming_total = sum(self._as_int(r.get("amount")) for r in incoming)
         incoming_hits = len(incoming)
 
-        attacks = self._as_int(crit_row.get("attacks"), len(mob_attacks))
-        hits = self._as_int(crit_row.get("hits"))
-        grazes = self._as_int(crit_row.get("grazing_hits"))
-        misses = self._as_int(crit_row.get("misses"))
-        threats = self._as_int(crit_row.get("critical_threats"))
-        confirmed = self._as_int(crit_row.get("confirmed_crits"))
-        failed_confirms = self._as_int(crit_row.get("failed_confirms"))
+        # Always count outcomes from sanitized event records, not the legacy
+        # crit_by_target CSV (which may misclassify resisted/unknown results).
+        attacks = len(mob_attacks)
+        hits = sum(a.get('outcome') in ('hit', 'critical_threat') for a in mob_attacks)
+        grazes = sum(a.get('outcome') == 'grazing_hit' for a in mob_attacks)
+        misses = sum(a.get('outcome') == 'miss' for a in mob_attacks)
+        threats = sum(a.get('outcome') == 'critical_threat' for a in mob_attacks)
+        cstats = confirmation_summary(mob_confirms)
+        confirmed = cstats['confirmed']
+        resisted = cstats['resisted']
+        failed_confirms = cstats['failed']
+        unknown_confirms = cstats['unknown']
+        mob_quality = assess_attack_integrity(mob_attacks, mob_confirms).get(target, {})
 
         # Evidence-based hit threshold bounds. Natural 1/20 and grazes are
         # excluded because they do not cleanly establish the ordinary full-hit
@@ -1488,95 +1504,155 @@ class App(tk.Tk):
             style="Small.TLabel",
         ).pack(anchor="w", pady=(2, 0))
 
+        ttk.Label(attacks_tab,
+                  text="Observed attack rolls only. Critical confirmations appear in Crits. "
+                       "Unknown roll values appear as '?'.",
+                  style="Small.TLabel", wraplength=1080).pack(anchor="w", pady=(2, 6))
         d20_tree = self._detail_tree(
             attacks_tab,
-            ("roll", "attacks", "miss", "graze", "hit", "threat", "other", "confirmed", "failed_confirm"),
-            ("d20", "Attacks", "Miss", "Graze", "Normal hit", "Crit threat", "Other", "Confirmed (2-19)", "Failed (2-19)"),
-            (60, 85, 75, 75, 90, 95, 70, 125, 115),
+            ("roll", "attacks", "miss", "graze", "hit", "threat", "other"),
+            ("d20", "Attacks", "Miss", "Graze", "Normal hit", "Crit threat", "Other"),
+            (70, 90, 80, 80, 105, 120, 80),
             numeric_columns=("roll", "attacks", "miss", "graze", "hit", "threat", "other"),
         )
-        by_roll = {n: {"attacks": 0, "miss": 0, "graze": 0, "hit": 0, "threat": 0, "other": 0, "confirmed": 0, "failed_confirm": 0, "confirm_attempts": 0} for n in range(1, 21)}
-        for r in mob_attacks:
-            roll = self._as_int(r.get("roll"), -1)
-            if roll not in by_roll:
-                continue
-            d = by_roll[roll]
-            d["attacks"] += 1
-            outcome = str(r.get("outcome", "")).strip()
-            if outcome == "miss":
-                d["miss"] += 1
-            elif outcome == "grazing_hit":
-                d["graze"] += 1
-            elif outcome == "critical_threat":
-                d["threat"] += 1
-            elif outcome == "hit":
-                d["hit"] += 1
-            else:
-                d["other"] += 1
-        for r in mob_confirms:
-            # Confirmation statistics are grouped by the confirmation d20 itself,
-            # not by the linked attack roll that produced the critical threat.
-            roll = self._as_int(r.get("roll"), -1)
-            if roll not in by_roll:
-                continue
-            by_roll[roll]["confirm_attempts"] += 1
-            if roll in (1, 20):
-                continue
-            confirmed_value = str(r.get("confirmed", "")).strip().lower() in ("1", "true", "yes")
-            by_roll[roll]["confirmed" if confirmed_value else "failed_confirm"] += 1
-        for roll in range(1, 21):
-            d = by_roll[roll]
-            if roll == 1:
-                confirmed_cell = "—"
-                failed_cell = "Auto fail" if not d["confirm_attempts"] else f"Auto fail ({d['confirm_attempts']})"
-            elif roll == 20:
-                confirmed_cell = "Auto confirm" if not d["confirm_attempts"] else f"Auto confirm ({d['confirm_attempts']})"
-                failed_cell = "—"
-            else:
-                confirmed_cell = d["confirmed"]
-                failed_cell = d["failed_confirm"]
-            d20_tree.insert("", "end", values=(roll, d["attacks"], d["miss"], d["graze"], d["hit"], d["threat"], d["other"], confirmed_cell, failed_cell))
+        for dist in attack_d20_rows(mob_attacks):
+            d20_tree.insert("", "end", values=(
+                dist['roll'], dist['total'], dist['miss'], dist['grazing_hit'],
+                dist['hit'], dist['critical_threat'], dist['other']))
 
         # Crits: target-level summary plus every confirmation roll.
         crit_summary = ttk.LabelFrame(crits_tab, text="Critical summary", padding=10)
-        crit_summary.pack(fill="x", pady=(0, 10))
-        mob_confirms_2_19 = []
-        for r in mob_confirms:
-            roll = self._as_int(r.get("roll"), -1)
-            if 2 <= roll <= 19:
-                mob_confirms_2_19.append(r)
-        confirm_attempts = len(mob_confirms_2_19)
-        confirmed_2_19 = sum(
-            1 for r in mob_confirms_2_19
-            if str(r.get("confirmed", "")).strip().lower() in ("1", "true", "yes")
-        )
-        failed_confirms_2_19 = confirm_attempts - confirmed_2_19
-        confirm_rate = (100.0 * confirmed_2_19 / confirm_attempts) if confirm_attempts else 0.0
-        crit_rate = self._as_float(crit_row.get("crit_rate_percent"))
-        observed = crit_row.get("observed_confirm", "") or "—"
-        high_fail = crit_row.get("highest_failed_confirm_total", "") or "—"
-        low_success = crit_row.get("lowest_successful_confirm_total", "") or "—"
+        crit_summary.pack(fill="x", pady=(0, 8))
+        def fmt_percentage(value):
+            return 'N/A' if value is None else f'{value:.1f}%'
+
+        crit_rate_label = (f'{100.0 * confirmed / attacks:.1f}%'
+                           if mob_quality.get('crit_rate_valid') and attacks else 'N/A')
+        # Exclude natural 1/20 only from the AC-threshold evidence, NOT from
+        # the observed d20 table or from overall success/failure totals.
+        eligible_failed = [self._as_int(c.get('total'), -1) for c in mob_confirms
+                           if c.get('outcome') == 'failed' and 2 <= self._as_int(c.get('roll'), -1) <= 19
+                           and self._as_int(c.get('total'), -1) >= 0]
+        eligible_success = [self._as_int(c.get('total'), -1) for c in mob_confirms
+                            if c.get('outcome') in ('confirmed', 'resisted')
+                            and 2 <= self._as_int(c.get('roll'), -1) <= 19
+                            and self._as_int(c.get('total'), -1) >= 0]
+        highest_failed = max(eligible_failed, default=None)
+        lowest_success = min(eligible_success, default=None)
+        high_fail = str(highest_failed) if highest_failed is not None else '—'
+        low_success = str(lowest_success) if lowest_success is not None else '—'
+        observed = threshold_label(highest_failed, lowest_success)
         ttk.Label(
             crit_summary,
-            text=(f"Threats: {threats:,}    Crits: {confirmed:,}    Crit rate: {crit_rate:.1f}%    "
-                  f"Confirm rolls 2-19: {confirm_attempts:,}    Confirmed: {confirmed_2_19:,}    "
-                  f"Failed: {failed_confirms_2_19:,}    Confirm rate: {confirm_rate:.1f}%"),
-            style="Section.TLabel",
+            text=(f"Threats: {threats:,}    Crits: {confirmed:,}    "
+                  f"Resisted: {resisted:,}    Failed: {failed_confirms:,}    "
+                  f"Unknown: {unknown_confirms:,}    Crit rate/attack: {crit_rate_label}"),
+            style="Section.TLabel", wraplength=1100,
         ).pack(anchor="w")
         ttk.Label(
             crit_summary,
-            text=(f"Observed confirmation threshold (total roll): {observed}    "
-                  f"Highest failed total: {high_fail}    Lowest successful total: {low_success}"),
-            style="Small.TLabel",
+            text=(f"Confirmation attempts: {cstats['attempts']:,}    "
+                  f"Success (confirmed + resisted): {fmt_percentage(cstats['confirmation_success_percent'])}    "
+                  f"Resisted/successful: {fmt_percentage(cstats['resisted_after_success_percent'])}    "
+                  f"Effective crit/known confirmation: {fmt_percentage(cstats['effective_crit_per_confirmation_percent'])}"),
+            style="Section.TLabel", wraplength=1100,
         ).pack(anchor="w", pady=(4, 0))
         ttk.Label(
             crit_summary,
-            text="Natural 1 = auto fail and natural 20 = auto confirm; both are excluded from Confirm % and threshold bounds.",
-            style="Small.TLabel",
-        ).pack(anchor="w", pady=(2, 0))
+            text=(f"Observed confirmation threshold (total roll): {observed}    "
+                  f"Highest failed total: {high_fail}    Lowest successful total: {low_success}. "
+                  "Rates exclude Unknown; threshold excludes natural 1/20."),
+            style="Small.TLabel", wraplength=1090,
+        ).pack(anchor="w", pady=(4, 0))
 
+        if crit_damage_for_target.get('quality_status') not in (None, 'OK'):
+            ttk.Label(
+                crits_tab,
+                text=('WARNING: Attack/confirmation data incomplete. Crit rate, APM and '
+                      'damage/crit estimates are unreliable and hidden; captured counts '
+                      'are lower bounds.'),
+                style='Section.TLabel', wraplength=1090,
+            ).pack(anchor='w', pady=(6, 8))
+        damage_box = ttk.LabelFrame(crits_tab, text="Attack-linked damage estimates", padding=10)
+        damage_box.pack(fill="x", pady=(0, 10))
+
+        def damage_label(field):
+            try:
+                return f"{float(crit_damage_for_target[field]):,.0f}"
+            except (KeyError, ValueError, TypeError):
+                return "N/A"
+
+        def matched_label(matched, total):
+            return (f"{crit_damage_for_target.get(matched, 0)}/"
+                    f"{crit_damage_for_target.get(total, 0)}")
+
+        def ratio_text():
+            try:
+                return f"{float(crit_damage_for_target['crit_damage_ratio']):.2f}x"
+            except (KeyError, ValueError, TypeError):
+                return "N/A"
+
+        ttk.Label(
+            damage_box,
+            text=(f"Avg. damage/crit (largest physical): {damage_label('avg_physical_crit')} "
+                  f"[{matched_label('matched_crits', 'confirmed_crits')} matched]    "
+                  f"Avg. damage/non-crit: {damage_label('avg_physical_noncrit')} "
+                  f"[{matched_label('matched_noncrit', 'noncrit_hits')} matched]    "
+                  f"Ratio: {ratio_text()}"),
+            style="Section.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            damage_box,
+            text=(f"Avg. damage/resisted crit: {damage_label('avg_physical_resisted')} "
+                  f"[{matched_label('matched_resisted', 'resisted_attacks')} matched]    "
+                  f"Avg. damage/failed confirm: {damage_label('avg_physical_failed')} "
+                  f"[{matched_label('matched_failed', 'failed_confirm_attacks')} matched]"),
+            style="Section.TLabel", wraplength=1090,
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Label(
+            damage_box,
+            text=(f"Avg. total observed damage/crit attack: {damage_label('avg_total_linked_crit')} "
+                  f"[{matched_label('total_linked_crits', 'confirmed_crits')} matched]"),
+            style="Section.TLabel",
+        ).pack(anchor="w", pady=(4, 0))
+        ttk.Label(
+            damage_box,
+            text=("Estimates only: the largest physical row (pierce/slash/bludgeon, including sneak) "
+                  "is selected per attack. Total includes all observed damage before the next attack "
+                  "within 0.75s. Delayed procs and multiple physical hits can make attribution uncertain. "
+                  "See crit_damage_attack_audit.csv for individual matches."),
+            style="Small.TLabel", wraplength=1100,
+        ).pack(anchor="w", pady=(4, 0))
+
+        # Confirmation rolls live in their own subtab; they must not be
+        # mistaken for attack d20 rolls. Keep a separate original-text log.
+        confirmation_notebook = ttk.Notebook(crits_tab)
+        confirmation_notebook.pack(fill="both", expand=True, pady=(4, 0))
+        confirmation_rolls_tab = ttk.Frame(confirmation_notebook, padding=6)
+        confirmation_log_tab = ttk.Frame(confirmation_notebook, padding=6)
+        confirmation_notebook.add(confirmation_rolls_tab, text="Confirmation d20")
+        confirmation_notebook.add(confirmation_log_tab, text="Confirmation log")
+
+        confirm_d20_tree = self._detail_tree(
+            confirmation_rolls_tab,
+            ("roll", "attempts", "confirmed", "resisted", "failed", "unknown"),
+            ("d20", "Attempts", "Confirmed", "Resisted", "Failed", "Unknown"),
+            (70, 105, 110, 110, 100, 95),
+            numeric_columns=("roll", "attempts", "confirmed", "resisted", "failed", "unknown"),
+        )
+        for dist in confirmation_d20_rows(mob_confirms):
+            confirm_d20_tree.insert("", "end", values=(
+                dist['roll'], dist['total'], dist['confirmed'], dist['resisted'],
+                dist['failed'], dist['unknown']))
+        ttk.Label(
+            confirmation_rolls_tab,
+            text="Natural 1 and 20 show their OBSERVED result. A resisted crit is "
+                 "a successful confirmation but does not deal critical damage. "
+                 "Unknown means unreadable or missing result text.",
+            style="Small.TLabel", wraplength=1050,
+        ).pack(anchor="w", pady=(6, 0))
         confirm_tree = self._detail_tree(
-            crits_tab,
+            confirmation_log_tab,
             ("time", "roll", "bonus", "total", "result", "text"),
             ("Time", "d20", "Bonus", "Total", "Result", "Combat Log text"),
             (80, 65, 80, 80, 95, 620),
@@ -1584,19 +1660,13 @@ class App(tk.Tk):
             stretch_columns=("text",),
         )
         for r in mob_confirms:
-            raw_time = r.get("elapsed_seconds", "")
             try:
-                display_time = self._format_graph_time(float(raw_time))
-            except Exception:
-                display_time = ""
-            roll = self._as_int(r.get("roll"), -1)
-            if roll == 1:
-                result = "AUTO FAIL"
-            elif roll == 20:
-                result = "AUTO CONFIRM"
-            else:
-                result = "CRIT" if str(r.get("confirmed", "")).strip().lower() in ("1", "true", "yes") else "FAILED"
-            confirm_tree.insert("", "end", values=(display_time, r.get("roll", ""), r.get("bonus", ""), r.get("total", ""), result, r.get("text", "")))
+                display_time = self._format_graph_time(float(r.get('elapsed_seconds', '')))
+            except (TypeError, ValueError):
+                display_time = ''
+            confirm_tree.insert("", "end", values=(
+                display_time, r.get('roll', ''), r.get('bonus', ''), r.get('total', ''),
+                str(r.get('outcome', 'unknown')).upper(), r.get('text', '')))
 
         # Damage by type.
         damage_types = defaultdict(lambda: {"regular": 0, "sneak": 0, "total": 0, "hits": 0})
@@ -1782,6 +1852,13 @@ class App(tk.Tk):
         for var in [self.attack_total_var, self.attack_hitmiss_var, self.attack_crits_var, self.attack_apm_var]:
             ttk.Label(summary, textvariable=var, style="Section.TLabel").pack(side="left", padx=(0, 28))
 
+        self.attack_quality_var = tk.StringVar(value='')
+        ttk.Label(self.attack_tab, textvariable=self.attack_quality_var,
+                  style='Section.TLabel', wraplength=1150).pack(anchor='w', pady=(0, 4))
+        self.attack_crit_damage_var = tk.StringVar(value="Avg. damage/crit: N/A")
+        ttk.Label(self.attack_tab, textvariable=self.attack_crit_damage_var,
+                  style="Section.TLabel", wraplength=1150).pack(anchor="w", pady=(0, 5))
+
         ttk.Label(
             self.attack_tab,
             text=(
@@ -1796,17 +1873,20 @@ class App(tk.Tk):
         by_target_tab = ttk.Frame(detail_tabs, padding=8)
         confirm_tab = ttk.Frame(detail_tabs, padding=8)
         rolls_tab = ttk.Frame(detail_tabs, padding=8)
+        confirmation_rolls_tab = ttk.Frame(detail_tabs, padding=8)
         detail_tabs.add(by_target_tab, text="By target")
-        detail_tabs.add(confirm_tab, text="Confirm rolls")
-        detail_tabs.add(rolls_tab, text="d20 distribution")
+        detail_tabs.add(rolls_tab, text="Attack d20 distribution")
+        detail_tabs.add(confirmation_rolls_tab, text="Confirmation d20 distribution")
+        detail_tabs.add(confirm_tab, text="Confirm log")
         self.attack_detail_notebook = detail_tabs
 
         # By target
         frame = ttk.Frame(by_target_tab)
         frame.pack(fill="both", expand=True)
         cols = (
-            "target", "attacks", "hits", "grazes", "misses", "threats", "crits", "failed",
-            "grazepct", "critpct", "confpct", "highfail", "lowsuccess", "observed"
+            "target", "attacks", "hits", "grazes", "misses", "threats", "crits",
+            "resisted", "failed", "unknown", "grazepct", "critpct", "confpct",
+            "highfail", "lowsuccess", "observed"
         )
         self.attack_summary_tree = ttk.Treeview(frame, columns=cols, show="headings")
         ys = ttk.Scrollbar(frame, orient="vertical", command=self.attack_summary_tree.yview)
@@ -1818,13 +1898,15 @@ class App(tk.Tk):
         frame.rowconfigure(0, weight=1); frame.columnconfigure(0, weight=1)
         headings = {
             "target": "Target", "attacks": "Attacks", "hits": "Hits", "grazes": "Grazes", "misses": "Misses",
-            "threats": "Threats", "crits": "Crits", "failed": "Fail 2-19",
+            "threats": "Threats", "crits": "Crits", "resisted": "Resisted",
+            "failed": "Failed", "unknown": "Unknown",
             "grazepct": "Graze %", "critpct": "Crit %", "confpct": "Conf. % 2-19",
             "highfail": "High fail", "lowsuccess": "Low success", "observed": "Observed confirm",
         }
         widths = {
             "target": 220, "attacks": 70, "hits": 60, "grazes": 70, "misses": 70, "threats": 75,
-            "crits": 60, "failed": 70, "grazepct": 75, "critpct": 70, "confpct": 75,
+            "crits": 60, "resisted": 70, "failed": 70, "unknown": 70,
+            "grazepct": 75, "critpct": 70, "confpct": 75,
             "highfail": 80, "lowsuccess": 85, "observed": 145,
         }
         for c in cols:
@@ -1834,8 +1916,9 @@ class App(tk.Tk):
             )
         self._enable_tree_sorting(
             self.attack_summary_tree,
-            numeric_columns=("attacks", "hits", "grazes", "misses", "threats", "crits", "failed",
-                             "grazepct", "critpct", "confpct", "highfail", "lowsuccess"),
+            numeric_columns=("attacks", "hits", "grazes", "misses", "threats", "crits",
+                             "resisted", "failed", "unknown", "grazepct", "critpct", "confpct",
+                             "highfail", "lowsuccess"),
         )
         self.attack_summary_tree.bind("<Double-1>", lambda event: self._open_target_from_tree(self.attack_summary_tree, event))
 
@@ -1864,23 +1947,39 @@ class App(tk.Tk):
             )
         self._enable_tree_sorting(self.confirm_tree, numeric_columns=("time", "roll", "bonus", "total"))
 
-        # d20 distribution
-        f3 = ttk.Frame(rolls_tab)
-        f3.pack(fill="both", expand=True)
-        cols3 = ("target", "roll", "miss", "graze", "hit", "threat", "other", "total")
-        self.roll_distribution_tree = ttk.Treeview(f3, columns=cols3, show="headings")
-        ys3 = ttk.Scrollbar(f3, orient="vertical", command=self.roll_distribution_tree.yview)
-        self.roll_distribution_tree.configure(yscrollcommand=ys3.set)
-        self.roll_distribution_tree.grid(row=0, column=0, sticky="nsew")
-        ys3.grid(row=0, column=1, sticky="ns")
-        f3.rowconfigure(0, weight=1); f3.columnconfigure(0, weight=1)
-        labels3 = {"target":"Target", "roll":"d20", "miss":"Miss", "graze":"Graze", "hit":"Hit", "threat":"Crit threat", "other":"Other", "total":"Total"}
-        for c in cols3:
-            self.roll_distribution_tree.heading(c, text=labels3[c])
-            self.roll_distribution_tree.column(c, width=220 if c == "target" else 80, anchor="w" if c == "target" else "e", stretch=False)
-        self._enable_tree_sorting(
-            self.roll_distribution_tree,
-            numeric_columns=("roll", "miss", "graze", "hit", "threat", "other", "total"),
+        # Independent global attack and confirmation d20 distributions.
+        # The data is rebuilt from normalized attack/confirmation events when
+        # opening old sessions; zero-observation roll values 1..20 are retained.
+        def make_roll_tree(tab, columns, labels, sizes):
+            holder = ttk.Frame(tab)
+            holder.pack(fill="both", expand=True)
+            tree = ttk.Treeview(holder, columns=columns, show="headings")
+            yscroll = ttk.Scrollbar(holder, orient="vertical", command=tree.yview)
+            xscroll = ttk.Scrollbar(holder, orient="horizontal", command=tree.xview)
+            tree.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+            tree.grid(row=0, column=0, sticky="nsew")
+            yscroll.grid(row=0, column=1, sticky="ns")
+            xscroll.grid(row=1, column=0, sticky="ew")
+            holder.rowconfigure(0, weight=1)
+            holder.columnconfigure(0, weight=1)
+            for name, label, width in zip(columns, labels, sizes):
+                tree.heading(name, text=label)
+                tree.column(name, width=width,
+                            anchor="w" if name == "target" else "e", stretch=False)
+            self._enable_tree_sorting(tree, numeric_columns=tuple(c for c in columns if c != "target"))
+            return tree
+
+        self.roll_distribution_tree = make_roll_tree(
+            rolls_tab,
+            ("target", "roll", "miss", "graze", "hit", "threat", "other", "total"),
+            ("Target", "d20", "Miss", "Graze", "Normal hit", "Crit threat", "Other", "Attacks"),
+            (220, 70, 80, 80, 110, 100, 80, 100),
+        )
+        self.confirmation_roll_distribution_tree = make_roll_tree(
+            confirmation_rolls_tab,
+            ("target", "roll", "attempts", "confirmed", "resisted", "failed", "unknown"),
+            ("Target", "d20", "Attempts", "Confirmed", "Resisted", "Failed", "Unknown"),
+            (220, 70, 100, 110, 110, 100, 100),
         )
 
     def _build_damage_log(self):
@@ -3820,6 +3919,8 @@ class App(tk.Tk):
         self.attack_total_var.set("Attacks: —")
         self.attack_hitmiss_var.set("Hits / misses: —")
         self.attack_crits_var.set("Confirmed crits: —")
+        self.attack_crit_damage_var.set("Avg. damage/crit: N/A")
+        self.attack_quality_var.set('')
         self.attack_apm_var.set(f"Peak {rolling_window_short(float(self.rolling_window_var.get().replace(' s', '')))} APM: —")
         for tree in [
             self.target_tree, self.type_tree,
@@ -4091,6 +4192,20 @@ class App(tk.Tk):
         total_grazes = sum(int(r.get("grazing_hits", "0") or 0) for r in crit_rows)
         total_misses = sum(int(r.get("misses", "0") or 0) for r in crit_rows)
         total_crits = sum(int(r.get("confirmed_crits", "0") or 0) for r in crit_rows)
+        normalized_attacks, normalized_confirms = relink_attack_confirmations(
+            [r for r in attack_rows if r.get('event') == 'attack'],
+            [r for r in attack_rows if r.get('event') == 'confirm'],
+        )
+        attack_quality = assess_attack_integrity(normalized_attacks, normalized_confirms)
+        bad_targets = {name for name, q in attack_quality.items() if q['status'] != 'OK'}
+        attack_rows = sorted(normalized_attacks + normalized_confirms,
+                             key=lambda r: int(r.get('line') or 0))
+        total_attacks = len(normalized_attacks)
+        total_hits = sum(a.get('outcome') in ('hit', 'critical_threat') for a in normalized_attacks)
+        total_grazes = sum(a.get('outcome') == 'grazing_hit' for a in normalized_attacks)
+        total_misses = sum(a.get('outcome') == 'miss' for a in normalized_attacks)
+        global_confirmation = confirmation_summary(normalized_confirms)
+        total_crits = global_confirmation['confirmed']
         peak_apm = None
         try:
             if apm_file.exists():
@@ -4110,24 +4225,57 @@ class App(tk.Tk):
         self.attack_hitmiss_var.set(
             f"Hits / grazes / misses: {dknum(total_hits)} / {dknum(total_grazes)} / {dknum(total_misses)}"
         )
-        self.attack_crits_var.set(f"Confirmed crits: {dknum(total_crits)}")
+        self.attack_crits_var.set(
+            f"Crits: {dknum(total_crits)}   Resisted: {dknum(global_confirmation['resisted'])}   "
+            f"Failed: {dknum(global_confirmation['failed'])}   "
+            f"Unknown: {dknum(global_confirmation['unknown'])}")
         self.attack_apm_var.set(
-            f"Peak {window_short} APM: —" if peak_apm is None else f"Peak {window_short} APM: {int(round(peak_apm))}"
+            f"Peak {window_short} APM: —" if peak_apm is None else
+            f"Peak {window_short} APM: {int(round(peak_apm))}" +
+            (' (observed lower bound)' if bad_targets else '')
+        )
+        self.attack_quality_var.set(
+            ('WARNING: Attack/confirmation records incomplete for ' + ', '.join(sorted(bad_targets)) +
+             '. Missing attacks cannot be inferred; crit rate and crit-damage estimates are suppressed.')
+            if bad_targets else ''
         )
 
-        confirm_stats_2_19 = defaultdict(lambda: {"attempts": 0, "confirmed": 0, "failed": 0})
-        for event in attack_rows:
-            if event.get("event") != "confirm":
-                continue
-            roll = self._as_int(event.get("roll"), -1)
-            if not 2 <= roll <= 19:
-                continue
-            d = confirm_stats_2_19[event.get("target", "")]
-            d["attempts"] += 1
-            if str(event.get("confirmed", "")).strip().lower() in ("1", "true", "yes"):
-                d["confirmed"] += 1
-            else:
-                d["failed"] += 1
+        try:
+            cd_rows = list(load_or_build_crit_damage(session).values())
+        except (OSError, ValueError, KeyError):
+            cd_rows = []
+
+        def weighted_average(value_field, count_field):
+            values = []
+            for row in cd_rows:
+                try:
+                    value, count = float(row[value_field]), int(row[count_field])
+                    if count > 0:
+                        values.append((value, count))
+                except (KeyError, ValueError, TypeError):
+                    pass
+            total_count = sum(n for _v, n in values)
+            return (sum(v * n for v, n in values) / total_count if total_count else None,
+                    total_count)
+
+        crit_avg, crit_n = weighted_average('avg_physical_crit', 'matched_crits')
+        non_avg, non_n = weighted_average('avg_physical_noncrit', 'matched_noncrit')
+        total_avg, total_n = weighted_average('avg_total_linked_crit', 'total_linked_crits')
+        ratio = crit_avg / non_avg if crit_avg is not None and non_avg else None
+        crit_total_n = sum(int(r.get('confirmed_crits', 0) or 0) for r in cd_rows)
+        non_total_n = sum(int(r.get('noncrit_hits', 0) or 0) for r in cd_rows)
+        fmt_avg = lambda v: "N/A" if v is None else f"{v:,.0f}"
+        self.attack_crit_damage_var.set(
+            f"Avg. damage/crit (largest physical, estimated): {fmt_avg(crit_avg)} "
+            f"({crit_n}/{crit_total_n})  |  Non-crit: {fmt_avg(non_avg)} "
+            f"({non_n}/{non_total_n})  |  Ratio: "
+            f"{'N/A' if ratio is None else f'{ratio:.2f}x'}  |  "
+            f"Total observed/crit: {fmt_avg(total_avg)} ({total_n}/{crit_total_n})"
+        )
+
+        confirm_stats_2_19 = {}
+        for target in {r.get('target', '') for r in normalized_confirms}:
+            confirm_stats_2_19[target] = confirmation_summary(normalized_confirms, target)
 
         self.clear_tree(self.attack_summary_tree)
         for r in crit_rows:
@@ -4137,18 +4285,27 @@ class App(tk.Tk):
                 except Exception:
                     return "—"
             target = r.get("target", "")
-            cstat = confirm_stats_2_19[target]
-            confirm_pct_2_19 = (
-                f"{(100.0 * cstat['confirmed'] / cstat['attempts']):.1f}%"
-                if cstat["attempts"] else "0.0%"
-            )
+            cstat = confirm_stats_2_19.get(target, {})
+            target_attacks = [a for a in normalized_attacks if a.get('target') == target]
+            high_fail, low_success, threshold_label_observed = observed_confirmation_threshold(
+                normalized_confirms, target)
+            target_hits = sum(a.get('outcome') in ('hit', 'critical_threat') for a in target_attacks)
+            target_grazes = sum(a.get('outcome') == 'grazing_hit' for a in target_attacks)
+            target_misses = sum(a.get('outcome') == 'miss' for a in target_attacks)
+            target_threats = sum(a.get('outcome') == 'critical_threat' for a in target_attacks)
+            val = cstat.get('confirmation_success_percent_2_19')
+            confirm_pct_2_19 = f'{val:.1f}%' if val is not None else 'N/A'
             self.attack_summary_tree.insert("", "end", values=(
-                target, r.get("attacks", ""), r.get("hits", ""), r.get("grazing_hits", ""), r.get("misses", ""),
-                r.get("critical_threats", ""), r.get("confirmed_crits", ""), cstat["failed"],
-                pct("grazing_rate_percent"), pct("crit_rate_percent"), confirm_pct_2_19,
-                r.get("highest_failed_confirm_total", "") or "—",
-                r.get("lowest_successful_confirm_total", "") or "—",
-                r.get("observed_confirm", "") or "—",
+                target, len(target_attacks), target_hits, target_grazes, target_misses,
+                target_threats, cstat.get('confirmed', 0), cstat.get('resisted', 0),
+                cstat.get('failed', 0), cstat.get('unknown', 0),
+                (f'{100 * target_grazes / len(target_attacks):.1f}%' if target_attacks else 'N/A'),
+                (f'{100 * cstat.get("confirmed", 0) / len(target_attacks):.1f}%'
+                 if target not in bad_targets and target_attacks else 'N/A'),
+                confirm_pct_2_19,
+                '—' if high_fail is None else high_fail,
+                '—' if low_success is None else low_success,
+                threshold_label_observed,
             ))
 
         self.clear_tree(self.confirm_tree)
@@ -4161,28 +4318,23 @@ class App(tk.Tk):
             except Exception:
                 display_time = ""
             roll = self._as_int(r.get("roll"), -1)
-            if roll == 1:
-                result = "AUTO FAIL"
-            elif roll == 20:
-                result = "AUTO CONFIRM"
-            else:
-                result = "CRIT" if str(r.get("confirmed", "")).strip().lower() in ("1", "true", "yes") else "FAILED"
+            result = str(r.get('outcome', 'unknown')).upper()
             self.confirm_tree.insert("", "end", values=(
                 display_time, r.get("target", ""), r.get("roll", ""), r.get("bonus", ""),
                 r.get("total", ""), result, r.get("text", "")
             ))
 
         self.clear_tree(self.roll_distribution_tree)
-        try:
-            with (session / "attack_roll_distribution.csv").open("r", encoding="utf-8", newline="") as f:
-                for r in csv.DictReader(f):
-                    self.roll_distribution_tree.insert("", "end", values=(
-                        r.get("target", ""), r.get("roll", ""), r.get("miss", ""),
-                        r.get("grazing_hit", ""), r.get("hit", ""),
-                        r.get("critical_threat", ""), r.get("other", ""), r.get("total", ""),
-                    ))
-        except Exception:
-            pass
+        for dist in attack_d20_rows(normalized_attacks):
+            self.roll_distribution_tree.insert("", "end", values=(
+                dist['target'], dist['roll'], dist['miss'], dist['grazing_hit'],
+                dist['hit'], dist['critical_threat'], dist['other'], dist['total']))
+
+        self.clear_tree(self.confirmation_roll_distribution_tree)
+        for dist in confirmation_d20_rows(normalized_confirms):
+            self.confirmation_roll_distribution_tree.insert("", "end", values=(
+                dist['target'], dist['roll'], dist['total'], dist['confirmed'],
+                dist['resisted'], dist['failed'], dist['unknown']))
 
         # Detailed per-event log
         self.clear_tree(self.damage_log_tree)

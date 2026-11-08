@@ -30,6 +30,7 @@ from cpu_utils import resolve_indra_threads
 from direct_indra_onnx import DirectIndraRecognizer
 from performance_mode import mode_from_config, scan_rate, ocr_threads
 from live_ocr_log import new_row, write_log
+from attack_crit_integrity import live_attack_start
 from live_input_diagnostics import LiveInputDiagnostics
 from focus_resume_guard import recover_append_rows
 from capture_geometry import rectangle
@@ -247,8 +248,8 @@ def needs_live_numeric_recheck(amount):
 
 
 def parse_attack_line(line):
-    """Return True for one player attack-roll line. Damage/proc lines do not count."""
-    return ATTACK_RE.search(line) is not None
+    """Count each new Combat Log attack message once, even if its roll wraps."""
+    return live_attack_start(line)
 
 
 def normalize_text(s):

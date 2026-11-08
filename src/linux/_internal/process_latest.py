@@ -27,6 +27,9 @@ from combat_log_visibility import CombatLogVisibilityGuard
 from combat_log_background import inspect_saved_background, save_background_report, BackgroundMonitor, WARNING_TEXT
 from live_ocr_log import read_log
 from performance_mode import comparison_summary, mode_from_config
+from crit_damage_metrics import analyze_crit_damage, save_crit_damage
+from attack_crit_integrity import (parse_and_link_attack_crit_events, assess_attack_integrity)
+from crit_roll_tables import (write_d20_distributions, confirmation_summary)
 from live_post_diagnostics import reconcile
 from damage_row_parser import (
     damage_wrap_kind, join_damage_wrap, is_complete_outgoing, outgoing_b_token,
@@ -1411,106 +1414,18 @@ def parse_incoming_defense_events(texts, line_times=None, line_numbers=None):
 
 
 def parse_attack_crit_events(texts, line_times=None, line_numbers=None):
-    """Parse player attack rolls and critical confirmation rolls.
+    """Parse observed rolls; also reconstruct safely wrapped rows.
 
-    An attack line counts once toward APM. A line whose result contains
-    "critical hit" is treated as a critical threat; the following confirmation
-    line determines whether the threat became a confirmed crit.
+    Missing attack messages remain missing, never synthesized from confirmations.
+    Each confirmation links only to ONE recent attack, within 0.75s/24 lines.
+    A resisted crit is NOT a final critical hit, although confirmation succeeded.
     """
-    attacks = []
-    confirms = []
-    last_threat_by_target = {}
-    last_attack_index_by_target = {}
-
-    for idx, line in enumerate(texts):
-        line_no = (
-            line_numbers[idx]
-            if line_numbers is not None and idx < len(line_numbers)
-            else idx + 1
-        )
-        elapsed_seconds = None
-        if line_times is not None and idx < len(line_times):
-            elapsed_seconds = line_times[idx]
-
-        m = ATTACK_RE.search(line)
-        if m:
-            roll, _, _, _ = parse_ocr_number(m.group("roll"))
-            bonus = None
-            if m.group("bonus"):
-                bonus, _, _, _ = parse_ocr_number(m.group("bonus"))
-            result_text = normalize_text(m.group("result"))
-            low = result_text.lower()
-            if "miss" in low:
-                outcome = "miss"
-            elif "grazing hit" in low:
-                outcome = "grazing_hit"
-            elif "critical hit" in low:
-                outcome = "critical_threat"
-            elif "hit" in low:
-                outcome = "hit"
-            else:
-                outcome = "other"
-            target = canonical_target(m.group("target"))
-            event = {
-                "line": line_no,
-                "elapsed_seconds": elapsed_seconds,
-                "event": "attack",
-                "target": target,
-                "roll": roll,
-                "bonus": bonus,
-                "total": (roll + bonus) if roll is not None and bonus is not None else None,
-                "outcome": outcome,
-                "confirmed": "",
-                "linked_attack_line": "",
-                "text": line,
-            }
-            attacks.append(event)
-            last_attack_index_by_target[target] = len(attacks) - 1
-            if outcome == "critical_threat":
-                last_threat_by_target[target] = line_no
-            continue
-
-        m = CONFIRM_RE.search(line)
-        if m:
-            roll, _, _, _ = parse_ocr_number(m.group("roll"))
-            bonus = None
-            if m.group("bonus"):
-                bonus, _, _, _ = parse_ocr_number(m.group("bonus"))
-            result_text = normalize_text(m.group("result"))
-            confirmed = "critical hit" in result_text.lower()
-            target = canonical_target(m.group("target"))
-
-            # A confirmation roll is itself authoritative evidence that the
-            # preceding attack generated a critical threat.  If OCR classified
-            # that attack merely as a normal hit, upgrade the most recent attack
-            # on the same target instead of losing the threat.
-            linked_attack_line = last_threat_by_target.get(target, "")
-            if not linked_attack_line:
-                ai = last_attack_index_by_target.get(target)
-                if ai is not None and 0 <= ai < len(attacks):
-                    prior = attacks[ai]
-                    if prior.get("outcome") not in ("miss", "grazing_hit"):
-                        prior["outcome"] = "critical_threat"
-                        linked_attack_line = prior.get("line", "")
-                        last_threat_by_target[target] = linked_attack_line
-
-            confirms.append({
-                "line": line_no,
-                "elapsed_seconds": elapsed_seconds,
-                "event": "confirm",
-                "target": target,
-                "roll": roll,
-                "bonus": bonus,
-                "total": (roll + bonus) if roll is not None and bonus is not None else None,
-                "outcome": "confirmed" if confirmed else "failed",
-                "confirmed": 1 if confirmed else 0,
-                "linked_attack_line": linked_attack_line,
-                "text": line,
-            })
-            last_threat_by_target.pop(target, None)
-
-    return attacks, confirms
-
+    return parse_and_link_attack_crit_events(
+        texts, line_times, line_numbers,
+        attack_re=ATTACK_RE, confirm_re=CONFIRM_RE,
+        parse_number=parse_ocr_number, normalize_text=normalize_text,
+        canonical_target=canonical_target,
+    )
 
 def observed_confirm_label(highest_failed, lowest_success):
     if highest_failed is not None and lowest_success is not None:
@@ -1546,90 +1461,99 @@ def observed_hit_label(highest_miss, lowest_hit):
 
 
 def summarize_attack_crit(attacks, confirms):
+    """Count OBSERVED attack rolls and distinct confirmation outcomes.
+
+    Incomplete attack coverage suppresses crit rate instead of showing >100%.
+    Resisted confirmations prove a successful roll but NOT a final critical hit.
+    """
+    quality = assess_attack_integrity(attacks, confirms)
     stats = defaultdict(lambda: {
-        "attacks": 0, "hits": 0, "grazes": 0, "misses": 0, "other": 0,
-        "threats": 0,
-        # Confirmation statistics use natural confirmation rolls 2-19 only.
-        # Actual confirmed critical hits are still counted across all rolls.
-        "confirm_attempts": 0, "confirmed": 0, "confirmed_2_19": 0, "failed": 0,
-        "all_confirm_attempts": 0, "all_failed": 0,
-        "highest_failed": None, "lowest_success": None,
-        "highest_miss_roll": None, "lowest_full_hit_roll": None,
-        "highest_miss_total": None, "lowest_full_hit_total": None,
+        'attacks': 0, 'hits': 0, 'grazes': 0, 'misses': 0, 'other': 0,
+        'threats': 0, 'confirm_attempts': 0, 'confirmed': 0,
+        'confirmed_2_19': 0, 'failed': 0, 'all_confirm_attempts': 0,
+        'all_failed': 0, 'resisted_confirms': 0, 'resisted_2_19': 0,
+        'unknown_confirms': 0, 'unlinked_confirms': 0,
+        'highest_failed': None, 'lowest_success': None,
+        'highest_miss_roll': None, 'lowest_full_hit_roll': None,
+        'highest_miss_total': None, 'lowest_full_hit_total': None,
     })
     for a in attacks:
-        d = stats[a["target"]]
-        d["attacks"] += 1
-        outcome = a["outcome"]
-        if outcome == "miss":
-            d["misses"] += 1
-        elif outcome == "grazing_hit":
-            d["grazes"] += 1
-        elif outcome in ("hit", "critical_threat"):
-            d["hits"] += 1
+        d = stats[a['target']]
+        d['attacks'] += 1
+        outcome = a.get('outcome', '')
+        if outcome == 'miss':
+            d['misses'] += 1
+        elif outcome == 'grazing_hit':
+            d['grazes'] += 1
+        elif outcome in ('hit', 'critical_threat'):
+            d['hits'] += 1
         else:
-            d["other"] += 1
-        if outcome == "critical_threat":
-            d["threats"] += 1
-
-        # Evidence-based attack threshold bounds. Natural 1/20 are excluded
-        # because automatic outcome rules can make them poor AC evidence.
-        # Grazing hits are deliberately neither misses nor full hits here.
-        roll = a.get("roll")
-        total = a.get("total")
-        threshold_eligible = isinstance(roll, int) and 2 <= roll <= 19
-        if threshold_eligible and outcome == "miss":
-            if d["highest_miss_roll"] is None or roll > d["highest_miss_roll"]:
-                d["highest_miss_roll"] = roll
-            if total is not None and (d["highest_miss_total"] is None or total > d["highest_miss_total"]):
-                d["highest_miss_total"] = total
-        elif threshold_eligible and outcome in ("hit", "critical_threat"):
-            if d["lowest_full_hit_roll"] is None or roll < d["lowest_full_hit_roll"]:
-                d["lowest_full_hit_roll"] = roll
-            if total is not None and (d["lowest_full_hit_total"] is None or total < d["lowest_full_hit_total"]):
-                d["lowest_full_hit_total"] = total
-
+            d['other'] += 1
+        if outcome == 'critical_threat':
+            d['threats'] += 1
+        roll, total = a.get('roll'), a.get('total')
+        if not isinstance(roll, int) or not (2 <= roll <= 19):
+            continue
+        if outcome == 'miss':
+            if d['highest_miss_roll'] is None or roll > d['highest_miss_roll']:
+                d['highest_miss_roll'] = roll
+            if total is not None and (d['highest_miss_total'] is None or total > d['highest_miss_total']):
+                d['highest_miss_total'] = total
+        elif outcome in ('hit', 'critical_threat'):
+            if d['lowest_full_hit_roll'] is None or roll < d['lowest_full_hit_roll']:
+                d['lowest_full_hit_roll'] = roll
+            if total is not None and (d['lowest_full_hit_total'] is None or total < d['lowest_full_hit_total']):
+                d['lowest_full_hit_total'] = total
     for c in confirms:
-        d = stats[c["target"]]
-        d["all_confirm_attempts"] += 1
-        if not c.get("linked_attack_line"):
-            d["threats"] += 1
-
-        total = c.get("total")
-        roll = c.get("roll")
-        stat_eligible = isinstance(roll, int) and 2 <= roll <= 19
-        threshold_eligible = stat_eligible and total is not None
-
-        # "confirmed" remains the count of actual confirmed critical hits,
-        # because it is also used for Crit % and total critical-hit counts.
-        if c["confirmed"]:
-            d["confirmed"] += 1
-            if stat_eligible:
-                d["confirmed_2_19"] += 1
-                if threshold_eligible:
-                    if d["lowest_success"] is None or total < d["lowest_success"]:
-                        d["lowest_success"] = total
+        d = stats[c['target']]
+        d['all_confirm_attempts'] += 1
+        if not c.get('linked_attack_line'):
+            d['unlinked_confirms'] += 1
+        roll, total = c.get('roll'), c.get('total')
+        eligible = isinstance(roll, int) and 2 <= roll <= 19
+        outcome = c.get('outcome', '')
+        if outcome == 'confirmed':
+            d['confirmed'] += 1
+            if eligible:
+                d['confirmed_2_19'] += 1
+                d['confirm_attempts'] += 1
+                if total is not None and (d['lowest_success'] is None or total < d['lowest_success']):
+                    d['lowest_success'] = total
+        elif outcome == 'failed':
+            d['all_failed'] += 1
+            if eligible:
+                d['failed'] += 1
+                d['confirm_attempts'] += 1
+                if total is not None and (d['highest_failed'] is None or total > d['highest_failed']):
+                    d['highest_failed'] = total
+        elif outcome == 'resisted':
+            # The confirmation roll succeeded, but fortification or a similar
+            # mechanic prevented the final critical hit.
+            d['resisted_confirms'] += 1
+            if eligible:
+                d['resisted_2_19'] += 1
+                d['confirm_attempts'] += 1
+                if total is not None and (d['lowest_success'] is None or total < d['lowest_success']):
+                    d['lowest_success'] = total
         else:
-            d["all_failed"] += 1
-            if stat_eligible:
-                d["failed"] += 1
-                if threshold_eligible:
-                    if d["highest_failed"] is None or total > d["highest_failed"]:
-                        d["highest_failed"] = total
-
-        if stat_eligible:
-            d["confirm_attempts"] += 1
-
-    for d in stats.values():
-        d["crit_rate"] = (100.0 * d["confirmed"] / d["attacks"]) if d["attacks"] else 0.0
-        d["crit_on_hits"] = (100.0 * d["confirmed"] / d["hits"]) if d["hits"] else 0.0
-        d["graze_rate"] = (100.0 * d["grazes"] / d["attacks"]) if d["attacks"] else 0.0
-        d["threat_rate"] = (100.0 * d["threats"] / d["attacks"]) if d["attacks"] else 0.0
-        d["confirm_rate"] = (
-            100.0 * d["confirmed_2_19"] / d["confirm_attempts"]
-        ) if d["confirm_attempts"] else 0.0
-        d["observed_confirm"] = observed_confirm_label(d["highest_failed"], d["lowest_success"])
-        d["observed_hit_total"] = observed_hit_label(d["highest_miss_total"], d["lowest_full_hit_total"])
+            d['unknown_confirms'] += 1
+        # Unknown cannot establish the confirmation threshold or rate.
+    for target in set(stats) | set(quality):
+        d = stats[target]
+        q = quality.get(target, {})
+        valid = bool(q.get('crit_rate_valid'))
+        d['rate_valid'] = valid
+        d['attack_status'] = q.get('status', 'UNKNOWN')
+        d['crit_rate'] = (100.0 * q.get('linked_confirmed_crits', 0) / d['attacks']
+                          if valid and d['attacks'] else None)
+        d['crit_on_hits'] = (100.0 * q.get('linked_confirmed_crits', 0) / d['hits']
+                             if valid and d['hits'] else None)
+        d['graze_rate'] = 100.0 * d['grazes'] / d['attacks'] if d['attacks'] else 0.0
+        d['threat_rate'] = 100.0 * d['threats'] / d['attacks'] if d['attacks'] else 0.0
+        d['confirm_rate'] = (100.0 * (d['confirmed_2_19'] + d['resisted_2_19']) / d['confirm_attempts']
+                             if d['confirm_attempts'] else 0.0)
+        d['observed_confirm'] = observed_confirm_label(d['highest_failed'], d['lowest_success'])
+        d['observed_hit_total'] = observed_hit_label(d['highest_miss_total'], d['lowest_full_hit_total'])
     return stats
 
 def build_apm_rows(attacks, window_seconds=15.0):
@@ -1859,6 +1783,25 @@ def create_reports(
         outgoing, incoming, healing
     )
     attack_stats = summarize_attack_crit(attacks, confirms)
+    attack_quality = assess_attack_integrity(attacks, confirms)
+    confirmation_by_target = {
+        target: confirmation_summary(confirms, target)
+        for target in sorted({c.get('target', 'Unknown') for c in confirms})
+    }
+    write_d20_distributions(session, attacks, confirms)
+    with (session / 'attack_integrity_by_target.csv').open('w', newline='', encoding='utf-8') as f:
+        quality_fields = [
+            'target', 'attacks', 'confirmations', 'linked_confirmations',
+            'unlinked_confirmations', 'confirmed_crit_messages',
+            'linked_confirmed_crits', 'resisted_confirmations',
+            'unknown_confirmations', 'unresolved_confirmations', 'status', 'crit_rate_valid', 'apm_reliable',
+        ]
+        writer = csv.DictWriter(f, fieldnames=quality_fields)
+        writer.writeheader()
+        for target, q in sorted(attack_quality.items()):
+            writer.writerow({'target': target, **{k: q[k] for k in quality_fields if k != 'target'}})
+    crit_damage_stats, crit_damage_audit = analyze_crit_damage(attacks, confirms, outgoing)
+    save_crit_damage(session, crit_damage_stats, crit_damage_audit)
 
     # Recording is intentionally paused whenever DDO is not foreground. Keep
     # those gaps visible in the report/data-quality summary because combat may
@@ -1922,6 +1865,12 @@ def create_reports(
     lines.append(f"Player attacks parsed:       {len(attacks)}")
     lines.append(f"Grazing hits:                {sum(d['grazes'] for d in attack_stats.values())}")
     lines.append(f"Confirmed critical hits:     {sum(d['confirmed'] for d in attack_stats.values())}")
+    lines.append(f"Crits resisted:              {sum(d['resisted_confirms'] for d in attack_stats.values())}")
+    lines.append(f"Failed confirmations:        {sum(d['all_failed'] for d in attack_stats.values())}")
+    lines.append(f"Unknown confirmation result: {sum(d['unknown_confirms'] for d in attack_stats.values())}")
+    if any(q['status'] != 'OK' for q in attack_quality.values()):
+        lines.append('WARNING: ATTACK DATA INCOMPLETE; APM and attack count are observed lower bounds.')
+        lines.append('Crit rate and attack-linked damage averages are N/A when linking is unreliable.')
     lines.append(f"Blocked outgoing damage:     {fmt(total_blocked_out)}")
     lines.append(f"Recording duration:          {duration:.2f} s")
     lines.append(f"Recording DPS:               {recording_dps:,.1f}")
@@ -1948,17 +1897,41 @@ def create_reports(
         f"{'Crits':>7}{'Fail 2-19':>10}{'Graze %':>9}{'Crit %':>9}{'Conf%2-19':>10}{'Observed confirm':>17}"
     )
     for target, d in sorted(attack_stats.items(), key=lambda kv: (-kv[1]['attacks'], kv[0].lower())):
+        crit_rate_cell = (f"{d['crit_rate']:.1f}%" if d['crit_rate'] is not None else 'N/A')
         lines.append(
             f"{target[:28]:<28}{d['attacks']:>8}{d['hits']:>7}{d['grazes']:>7}{d['misses']:>7}{d['threats']:>9}"
-            f"{d['confirmed']:>7}{d['failed']:>10}{d['graze_rate']:>8.1f}%{d['crit_rate']:>8.1f}%{d['confirm_rate']:>9.1f}%"
+            f"{d['confirmed']:>7}{d['failed']:>10}{d['graze_rate']:>8.1f}%{crit_rate_cell:>9}{d['confirm_rate']:>9.1f}%"
             f"{d['observed_confirm']:>17}"
         )
     if not attack_stats:
         lines.append("(No player attack-roll lines recognized.)")
     lines.append("")
     lines.append("Observed confirm is evidence-based: e.g. <=186 means 186 succeeded, but no failure proves the exact threshold.")
-    lines.append("Confirm % and confirmation fail counts use natural confirmation rolls 2-19 only; natural 1/20 are excluded.")
+    lines.append("Confirm % (2-19) = (Confirmed + Resisted) / (Confirmed + Resisted + Failed), for rolls 2-19.")
+    lines.append("Resisted confirms succeeded as rolls but did not yield actual critical damage; Unknown is excluded from rates.")
+    lines.append("Separate attack and confirmation d20 distributions, including observed 1/20 results, are saved as CSV.")
     lines.append("Target defenses and debuffs can change during combat; conflicting observations are reported as varying.")
+    lines.append("")
+    lines.append("ESTIMATED DAMAGE BY ATTACK - PHYSICAL AND ALL OBSERVED EVENTS")
+    lines.append("-" * 110)
+    for target, row in crit_damage_stats.items():
+        def display_average(key):
+            try:
+                return f"{float(row[key]):,.1f}"
+            except (ValueError, TypeError, KeyError):
+                return "N/A"
+        lines.append(f"{target}:")
+        lines.append(f"  Avg. largest physical/crit:     {display_average('avg_physical_crit')} "
+                     f"({row['matched_crits']}/{row['confirmed_crits']} linked)")
+        lines.append(f"  Avg. largest physical/noncrit:  {display_average('avg_physical_noncrit')} "
+                     f"({row['matched_noncrit']}/{row['noncrit_hits']} linked)")
+        lines.append(f"  Crit/normal damage ratio:       {display_average('crit_damage_ratio')}x")
+        lines.append(f"  Avg. total observed/crit:       {display_average('avg_total_linked_crit')} "
+                     f"({row['total_linked_crits']}/{row['confirmed_crits']} linked)")
+    lines.append("NOTE: The largest physical damage row per attack (including sneak) is an estimate,")
+    lines.append("not proof of weapon damage. Total includes all outgoing damage within the")
+    lines.append("next-attack boundary and a 0.75s window; procs can be delayed or unrelated.")
+    lines.append("Inspect crit_damage_attack_audit.csv for each event-to-attack match.")
     lines.append("")
 
     lines.append("DAMAGE BY TARGET")
@@ -2190,7 +2163,7 @@ def create_reports(
             f,
             fieldnames=[
                 "line", "elapsed_seconds", "event", "target", "roll", "bonus",
-                "total", "outcome", "confirmed", "linked_attack_line", "text"
+                "total", "outcome", "confirmed", "linked_attack_line", "text", "link_status"
             ],
         )
         w.writeheader()
@@ -2206,6 +2179,8 @@ def create_reports(
             "grazing_rate_percent", "crit_rate_percent", "crit_on_hits_percent", "threat_rate_percent",
             "confirm_rate_percent", "confirm_rate_2_19_percent", "highest_failed_confirm_total",
             "lowest_successful_confirm_total", "observed_confirm",
+            "resisted_crits", "unknown_confirmations", "confirmation_success_percent",
+            "fortification_resisted_percent", "effective_crit_per_known_confirmation_percent",
             "highest_miss_roll", "lowest_full_hit_roll",
             "highest_miss_total", "lowest_full_hit_total", "observed_hit_total"
         ])
@@ -2214,11 +2189,20 @@ def create_reports(
                 target, d["attacks"], d["hits"], d["grazes"], d["misses"], d["threats"],
                 d["confirm_attempts"], d["confirmed"], d["failed"], d["confirmed_2_19"],
                 d["all_confirm_attempts"], d["all_failed"],
-                f"{d['graze_rate']:.3f}", f"{d['crit_rate']:.3f}", f"{d['crit_on_hits']:.3f}",
+                f"{d['graze_rate']:.3f}",
+                '' if d['crit_rate'] is None else f"{d['crit_rate']:.3f}",
+                '' if d['crit_on_hits'] is None else f"{d['crit_on_hits']:.3f}",
                 f"{d['threat_rate']:.3f}", f"{d['confirm_rate']:.3f}", f"{d['confirm_rate']:.3f}",
                 "" if d["highest_failed"] is None else d["highest_failed"],
                 "" if d["lowest_success"] is None else d["lowest_success"],
                 d["observed_confirm"],
+                d['resisted_confirms'], d['unknown_confirms'],
+                '' if confirmation_by_target.get(target, {}).get('confirmation_success_percent') is None else
+                f"{confirmation_by_target[target]['confirmation_success_percent']:.3f}",
+                '' if confirmation_by_target.get(target, {}).get('resisted_after_success_percent') is None else
+                f"{confirmation_by_target[target]['resisted_after_success_percent']:.3f}",
+                '' if confirmation_by_target.get(target, {}).get('effective_crit_per_confirmation_percent') is None else
+                f"{confirmation_by_target[target]['effective_crit_per_confirmation_percent']:.3f}",
                 "" if d["highest_miss_roll"] is None else d["highest_miss_roll"],
                 "" if d["lowest_full_hit_roll"] is None else d["lowest_full_hit_roll"],
                 "" if d["highest_miss_total"] is None else d["highest_miss_total"],
@@ -2497,6 +2481,9 @@ def create_reports(
         "sneak_share_percent": sneak_share,
         "average_sneak_damage": sneak_avg,
         "sneak_attacks_per_minute": sneak_per_min,
+        "crit_damage_estimates": crit_damage_stats,
+        "attack_integrity": attack_quality,
+        "confirmation_results": confirmation_by_target,
         "blocked_outgoing": total_blocked_out,
         "blocked_incoming": total_blocked_in,
         "recording_duration_seconds": duration,

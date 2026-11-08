@@ -43,6 +43,10 @@ jobs:
               assert (internal / 'combat_log_visibility.py').is_file()
               assert (internal / 'combat_log_background.py').is_file()
               assert (internal / 'damage_row_parser.py').is_file()
+              assert (internal / 'attack_crit_integrity.py').is_file()
+              assert (internal / 'crit_roll_tables.py').is_file()
+              assert (internal / 'crit_damage_metrics.py').is_file()
+              assert (Path('src') / platform / 'tests' / 'test_crit_roll_tables_v2.py').is_file()
               assert (internal / 'session_resource_monitor.py').is_file()
               assert (Path('src') / platform / 'tests' / 'test_background_black.py').is_file()
               import json
