@@ -84,6 +84,11 @@ jobs:
           mkdir -p dist/staging/windows dist/staging/linux
           cp -a src/windows/. dist/staging/windows/
           cp -a src/linux/. dist/staging/linux/
+          # Test files and generated Python bytecode are not application files.
+          # The automatic updater accepts only its documented file allowlist.
+          rm -rf dist/staging/windows/tests dist/staging/linux/tests
+          find dist/staging -type d -name '__pycache__' -prune -exec rm -rf {} +
+          find dist/staging -type f \( -name '*.pyc' -o -name '*.pyo' \) -delete
           for platform in windows linux; do
             cp LICENSE THIRD_PARTY_NOTICES.md "dist/staging/$platform/"
             printf 'DDO Combat Analyzer\nSource commit: %s\n' "$GITHUB_SHA" > "dist/staging/$platform/VERSION.txt"
@@ -117,6 +122,28 @@ jobs:
           unzip -tqq dist/DDO-Combat-Analyzer-Linux.zip
           unzip -p dist/DDO-Combat-Analyzer-Windows.zip 'VERSION.txt' | grep -F "$GITHUB_SHA"
           unzip -p dist/DDO-Combat-Analyzer-Linux.zip 'VERSION.txt' | grep -F "$GITHUB_SHA"
+
+          # Exercise the strict in-app updater against BOTH release archives.
+          python - <<'PY'
+          import os
+          import runpy
+          import tempfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          sha = os.environ['GITHUB_SHA']
+          tag = f"v{datetime.now(timezone.utc):%Y.%m.%d}-{sha[:8]}"
+          with tempfile.TemporaryDirectory() as temp:
+              for platform in ('windows', 'linux'):
+                  path = Path('src') / platform / '_internal' / 'update_manager.py'
+                  update = runpy.run_path(str(path))
+                  archive = Path('dist') / ('DDO-Combat-Analyzer-' + platform.capitalize() + '.zip')
+                  approved_files = update['prepare_update'](
+                      archive, Path(temp) / platform, {'platform': platform, 'tag': tag}
+                  )
+                  assert len(approved_files) > 20, (platform, len(approved_files))
+                  print(f'{platform}: updater accepts {len(approved_files)} release files')
+          PY
           sha256sum dist/DDO-Combat-Analyzer-*.zip
 
       - name: Publish versioned GitHub Release containing both platforms
@@ -138,6 +165,7 @@ jobs:
           - **Scroll recovery:** Confident prior-frame alignment recovers scrolls missed by stale anchors; long unresolved stalls are diagnosed rather than guessed.
           - **Zoning protection:** Detects loading/hidden Combat Log, suspends OCR while hidden and re-baselines on return to avoid re-counting old damage. Rolling DPS still decays after the selected inactivity window.
           - **Diagnostics:** Saves idle zoning transitions in _internal/live_zone_diagnostics.jsonl (bounded), plus per-session zoning and capture geometry checks; Replay Live and FFV1 also avoid re-parsing returning chat.
+          - **Fix:** Both downloadable ZIPs exclude source-only tests and Python bytecode; GitHub Actions verifies updater compatibility for Windows and Linux before publishing.
           - **Testing:** Local simulated zoning and live/replay integration passed; a longer real in-game zoning-after-damage regression test is still recommended.
           - **Windows:** Download DDO-Combat-Analyzer-Windows.zip, extract it, run SETUP DDO Combat Analyzer.cmd once, then START DDO Combat Analyzer.cmd.
           - **Linux (Mint/Cinnamon X11):** Download DDO-Combat-Analyzer-Linux.zip, extract it, run bash 'SETUP DDO Combat Analyzer.sh' once, then ./START_DDO_COMBAT_ANALYZER.sh.
@@ -166,7 +194,7 @@ jobs:
           grep -Fx 'DDO-Combat-Analyzer-Windows.zip' <<<"$current_assets"
           grep -Fx 'DDO-Combat-Analyzer-Linux.zip' <<<"$current_assets"
 
-          # User requested exactly ONE publicly available GitHub Release.
+          # Delete superseded releases only AFTER both new ZIPs are verified.
           # Never delete the newly published one. --cleanup-tag also removes
           # historical version tags, so the Releases page shows one version.
           while IFS= read -r old_tag; do
