@@ -49,6 +49,12 @@ cover the live OCR helper, not DDO, GUI, FFmpeg or the entire computer.
 
 ## OCR and capture
 
+**Important capture-area setup:** Select only the scrolling Combat Log text.
+Exclude the bottom chat input line (which may say **Say**, **Group**, **Guild**
+or another channel), the scrollbar and all window borders. Including these
+static UI elements can silently displace real combat lines and undercount
+attacks or damage. Reselect the area if totals or attack counts look wrong.
+
 The current code uses:
 
 - Indra Direct (recognition-only ONNX, default), or Indra Full (fallback)

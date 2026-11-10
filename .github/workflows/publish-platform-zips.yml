@@ -157,6 +157,8 @@ jobs:
           cat > dist/RELEASE_NOTES.md <<EOF
           DDO Combat Analyzer for Windows and Linux (X11).
 
+          - **Capture selection:** The on-screen selector, first-run guide and main GUI now explicitly exclude the bottom chat input (Say, Group, Guild or any other channel), scrollbar and window borders. Capturing only the scrolling Combat Log text prevents missing attack and damage lines.
+          - **Scope:** This update changes selection guidance only; OCR and damage parsing behavior are unchanged.
           - **New:** Indra Direct ONNX recognition-only OCR is the default on Windows and Linux, with Indra Full still available as fallback.
           - **Light:** 20-FPS OCR tracking, at most 2 OCR threads, no FFmpeg/video capture or redundant screenshot diagnostics. Saved live OCR supports rebuilding reports, not independent video reanalysis.
           - **Defaults on NEW and UPDATED installations:** Light and Indra Direct. A one-time migration applies these settings to saved configurations, retaining capture area, other settings and session history. Future user changes are preserved.

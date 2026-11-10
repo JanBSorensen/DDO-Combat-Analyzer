@@ -787,7 +787,9 @@ class App(tk.Tk):
 
         reminder = ttk.Label(
             control,
-            text="Before recording: make sure the DDO Combat Log tab is visible.",
+            text=("Before recording: make sure the DDO Combat Log tab is visible.\n"
+                  "Capture only scrolling text; exclude Say / Group / Guild, scrollbar and borders."),
+            justify="left",
             style="Small.TLabel"
         )
         reminder.pack(anchor="w", pady=(8, 0))
@@ -3423,7 +3425,8 @@ class App(tk.Tk):
 
         guide_text = (
             "1. Select your Combat Log area\n"
-            "   Make sure the full visible Combat Log is inside the selected area.\n\n"
+            "   Select only scrolling Combat Log text; exclude the chat input\n"
+            "   (Say / Group / Guild / etc.), scrollbar and window borders.\n\n"
             "2. Position the DPS overlay\n"
             "   Drag it where you want it. Double-click to save the position.\n\n"
             "3. Start/stop a recorded session with Pause/Break\n"
@@ -3650,7 +3653,9 @@ class App(tk.Tk):
                 "Select combat log area",
                 "DDO must be running with the combat log visible.\n\n"
                 "When you click OK, this window will hide, DDO will be brought to the front, "
-                "and a frozen screenshot will be taken. Then select ONLY the combat log."
+                "and a frozen screenshot will be taken.\n\n"
+                "Select ONLY scrolling Combat Log text. Exclude the bottom chat input\n"
+                "(Say / Group / Guild / etc.), scrollbar and window borders."
             ):
                 return
 

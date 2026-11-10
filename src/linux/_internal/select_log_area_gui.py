@@ -161,7 +161,7 @@ class FrozenScreenshotSelector:
 
         # Dark instruction panel on top of the frozen screenshot.
         panel = self.canvas.create_rectangle(
-            20, 20, 650, 92,
+            20, 20, min(790, monitor["width"] - 20), 119,
             fill="#111111",
             outline="#dddddd",
             width=1,
@@ -178,7 +178,15 @@ class FrozenScreenshotSelector:
             anchor="nw",
             fill="#dddddd",
             font=("Segoe UI", 10),
-            text="Drag a rectangle around ONLY the combat-log text.  ESC = cancel.",
+            text="Drag around ONLY the scrolling Combat Log text.  ESC = cancel.",
+        )
+        self.canvas.create_text(
+            36, 87,
+            anchor="nw",
+            fill="#ffce70",
+            font=("Segoe UI", 10, "bold"),
+            text="Exclude chat input (Say / Group / Guild / etc.), scrollbar and window borders.",
+            width=max(240, min(750, monitor["width"] - 70)),
         )
 
         self.canvas.bind("<ButtonPress-1>", self.on_press)

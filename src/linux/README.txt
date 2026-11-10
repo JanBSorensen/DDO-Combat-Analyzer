@@ -23,6 +23,10 @@ Light uses 20 FPS and at most two OCR threads, with no video recording.
 Light can rebuild reports from saved OCR. Full retains independent FFV1
 video reanalysis and Replay Live. Continuous Live is enabled in Light.
 Use an opaque solid black DDO Combat Log background.
+When selecting a capture area, include only the scrolling Combat Log text.
+Do NOT include the bottom chat input row (Say, Group, Guild or another
+channel), scrollbar or window borders: these can cause missed combat lines.
+If attack or damage counts look wrong, reselect the capture area.
 Non-invasive: only screen capture, no game memory access.
 
 Source: https://github.com/JanBSorensen/DDO-Combat-Analyzer
