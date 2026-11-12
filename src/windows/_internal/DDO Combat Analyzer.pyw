@@ -704,6 +704,9 @@ class App(tk.Tk):
         style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"))
         style.configure("Section.TLabel", font=("Segoe UI", 11, "bold"))
         style.configure("Big.TLabel", font=("Segoe UI", 19, "bold"))
+        style.configure("OverviewHero.TLabel", font=("Segoe UI", 31, "bold"))
+        style.configure("OverviewValue.TLabel", font=("Segoe UI", 19, "bold"))
+        style.configure("OverviewMinor.TLabel", font=("Segoe UI", 15, "bold"))
         style.configure("Small.TLabel", font=("Segoe UI", 9))
         style.configure("Accent.TButton", font=("Segoe UI", 11, "bold"), padding=(14, 10))
         style.configure("Stop.TButton", font=("Segoe UI", 11, "bold"), padding=(14, 10))
@@ -740,11 +743,15 @@ class App(tk.Tk):
         self.update_button.pack(side="right", padx=(0, 8))
 
         # Setup / control panel
-        control = ttk.LabelFrame(outer, text="Recording", padding=12)
-        control.pack(fill="x", pady=(12, 10))
+        control = ttk.LabelFrame(outer, text="Recording", padding=(10, 6))
+        self._recording_control = control
+        self._recording_layout_mode = None
+        self._recording_reflow_ready = False
+        self._recording_resize_job = None
+        control.pack(fill="x", pady=(5, 5))
 
         row1 = ttk.Frame(control)
-        row1.pack(fill="x")
+        self._rec_capture_row = row1
 
         self.capture_label = ttk.Label(row1, text="Combat log area: ...")
         self.capture_label.pack(side="left", fill="x", expand=True)
@@ -775,16 +782,20 @@ class App(tk.Tk):
             justify="left",
             style="Small.TLabel"
         )
-        reminder.pack(anchor="w", pady=(8, 0))
+        self._rec_reminder = reminder
+        reminder.configure(text=(
+            "Combat Log visible; capture scrolling text only (exclude Say / Group / Guild, "
+            "scrollbars and borders)."
+        ))
         self.background_alert_var = tk.StringVar(value=(
             'Combat Log background: use solid opaque black (check starts in DDO).'))
         self.background_alert_label = tk.Label(
             control, textvariable=self.background_alert_var,
             fg='#a36c12', anchor='w', justify='left', font=('Segoe UI', 9, 'bold'))
-        self.background_alert_label.pack(anchor='w', fill='x', pady=(4, 0))
+        # Positioned by _recording_reflow; dynamic text is preserved.
 
         row2 = ttk.Frame(control)
-        row2.pack(fill="x", pady=(12, 0))
+        self._rec_action_row = row2
 
         self.status_dot = tk.Canvas(row2, width=16, height=16, highlightthickness=0)
         self.status_dot.pack(side="left", padx=(0, 7))
@@ -812,7 +823,7 @@ class App(tk.Tk):
 
         # Session actions kept near the top so old analyses are easy to revisit.
         row3 = ttk.Frame(control)
-        row3.pack(fill="x", pady=(10, 0))
+        self._rec_session_row = row3
 
         self.open_session_btn = ttk.Button(
             row3, text="Open session...", command=self.open_session_browser
@@ -842,7 +853,26 @@ class App(tk.Tk):
         self.detail_label = ttk.Label(row3, text="")
         self.detail_label.pack(side="right")
 
-        row4 = ttk.Frame(control)
+        self._advanced_settings_open = False
+        self.advanced_toggle = ttk.Button(
+            control, text="Advanced settings...", command=self._toggle_advanced_settings
+        )
+        # Positioned by _recording_reflow.
+        self.advanced_window = tk.Toplevel(self)
+        self.advanced_window.title("DDO Combat Analyzer - Advanced settings")
+        self.advanced_window.transient(self)
+        self.advanced_window.withdraw()
+        screen_width = max(900, self.winfo_screenwidth())
+        screen_height = max(690, self.winfo_screenheight())
+        popup_width = min(940, max(740, screen_width - 65))
+        popup_height = min(415, max(340, screen_height - 90))
+        self.advanced_window.geometry(f"{popup_width}x{popup_height}")
+        self.advanced_window.minsize(740, 305)
+        self.advanced_window.protocol("WM_DELETE_WINDOW", self._hide_advanced_settings)
+        self.advanced_window.bind("<Escape>", lambda _event: self._hide_advanced_settings())
+        self.advanced_controls = ttk.Frame(self.advanced_window, padding=12)
+        self.advanced_controls.pack(fill="both", expand=True)
+        row4 = ttk.Frame(self.advanced_controls)
         row4.pack(fill="x", pady=(10, 0))
         self.continuous_check = ttk.Checkbutton(
             row4, text="Continuous live DPS", variable=self.continuous_live_var,
@@ -867,7 +897,7 @@ class App(tk.Tk):
         self.position_overlay_btn = ttk.Button(row4, text="Position overlay", command=self.position_overlay)
         self.position_overlay_btn.pack(side="left", padx=(8, 0))
 
-        row5 = ttk.Frame(control)
+        row5 = ttk.Frame(self.advanced_controls)
         row5.pack(fill="x", pady=(8, 0))
         ttk.Label(row5, text="Rolling DPS/APM window:").pack(side="left")
         self.rolling_window_combo = ttk.Combobox(
@@ -890,7 +920,7 @@ class App(tk.Tk):
             style="Small.TLabel"
         ).pack(side="left")
 
-        row6 = ttk.Frame(control)
+        row6 = ttk.Frame(self.advanced_controls)
         row6.pack(fill="x", pady=(8, 0))
         ttk.Label(row6, text="OCR threads:").pack(side="left")
         self.ocr_threads_combo = ttk.Combobox(
@@ -910,7 +940,7 @@ class App(tk.Tk):
         ).pack(side="left")
 
         # One GUI, two modes. Never reduce Combat Log width or OCR accuracy.
-        ocr_row = ttk.Frame(control)
+        ocr_row = ttk.Frame(self.advanced_controls)
         ocr_row.pack(fill='x', pady=(7, 0))
         ttk.Label(ocr_row, text='OCR engine:').pack(side='left')
         self.ocr_engine_combo = ttk.Combobox(
@@ -921,7 +951,7 @@ class App(tk.Tk):
         self.ocr_engine_combo.bind('<<ComboboxSelected>>', self.on_ocr_engine_changed)
 
         mode_row = ttk.Frame(control)
-        mode_row.pack(fill='x', pady=(9, 0))
+        self._rec_mode_row = mode_row
         ttk.Label(mode_row, text='Performance mode:').pack(side='left')
         self.performance_combo = ttk.Combobox(
             mode_row, textvariable=self.performance_mode_var,
@@ -933,8 +963,14 @@ class App(tk.Tk):
 
         # Resource comparison uses whole process tree, not just the OCR helper.
         self.resource_status_var = tk.StringVar(value='CPU/RAM: measured while recording (GUI + OCR + recorder + FFmpeg).')
-        ttk.Label(control, textvariable=self.resource_status_var, style='Small.TLabel').pack(
+        ttk.Label(self.advanced_controls, textvariable=self.resource_status_var, style='Small.TLabel').pack(
             anchor='w', pady=(7, 0))
+
+        ttk.Button(self.advanced_controls, text="Close settings",
+                   command=self._hide_advanced_settings).pack(anchor="e", pady=(9, 0))
+        self._recording_reflow_ready = True
+        self.bind("<Configure>", self._recording_on_resize, add="+")
+        self.after_idle(self._v3_install_ui)
 
         # Progress line
         prog = ttk.Frame(outer)
@@ -946,6 +982,7 @@ class App(tk.Tk):
 
         # Results: make it visually obvious that several selectable views are available.
         results_header = ttk.Frame(outer)
+        self._v3_results_header = results_header
         results_header.pack(fill="x", pady=(2, 4))
         ttk.Label(
             results_header, text="RESULTS — choose a tab below", style="ResultsTitle.TLabel"
@@ -1000,50 +1037,642 @@ class App(tk.Tk):
         except Exception:
             pass
 
-    def _metric_card(self, parent, title, var, col):
-        frame = ttk.LabelFrame(parent, text=title, padding=(12, 10))
-        frame.grid(row=0, column=col, sticky="nsew", padx=5)
-        ttk.Label(frame, textvariable=var, style="Big.TLabel").pack(anchor="center", pady=8)
+    # ===== BEGIN LOCAL SIMPLIFIED UI V3 (Windows, GitHub untouched) =====
+    def _v3_install_ui(self):
+        """Simplify the V2 window *without* rebuilding it or deleting callbacks."""
+        if getattr(self, '_v3_ready', False):
+            return
+        self._v3_ready = True
+
+        # Help replaces three persistent header buttons, without deleting the
+        # original button instances (the updater still owns update_button).
+        top = self._recording_control.master.winfo_children()[0]
+        for name in ('system_button', 'about_button', 'update_button'):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.pack_forget()
+        self._v3_help_button = ttk.Menubutton(top, text='Help')
+        self._v3_help_menu = tk.Menu(
+            self._v3_help_button, tearoff=0, postcommand=self._v3_refresh_help_menu)
+        self._v3_help_menu.add_command(label='System check', command=self.show_system_check)
+        self._v3_help_menu.add_command(label='Check for updates', command=self.check_for_updates)
+        self._v3_help_menu.add_separator()
+        self._v3_help_menu.add_command(label='About', command=self.show_about)
+        self._v3_help_button.configure(menu=self._v3_help_menu)
+        self._v3_help_button.pack(side='right', padx=(0, 8))
+        system = getattr(self, 'system_label', None)
+        if system is not None:
+            system.configure(cursor='hand2')
+            system.bind('<Button-1>', lambda _event: (self.show_system_check()
+                if self.proc is None else None), add='+')
+
+        # Preserve the original line_height_combo object for pre-existing state
+        # handling. The newly visible control shares its tk variable and callback.
+        original = self.line_height_combo
+        for child in original.master.winfo_children():
+            if isinstance(child, ttk.Label) and str(child.cget('text')).strip() == 'Line height:':
+                child.pack_forget()
+        original.pack_forget()
+        line_row = ttk.Frame(self.advanced_controls)
+        children = self.advanced_controls.winfo_children()
+        if children:
+            line_row.pack(fill='x', pady=(0, 8), before=children[0])
+        else:
+            line_row.pack(fill='x', pady=(0, 8))
+        ttk.Label(line_row, text='Combat Log line height:').pack(side='left', padx=(0, 8))
+        self._v3_line_height_combo = ttk.Combobox(
+            line_row, textvariable=self.line_height_var,
+            values=original.cget('values'), state=str(original.cget('state')),
+            width=8,
+        )
+        self._v3_line_height_combo.pack(side='left')
+        self._v3_line_height_combo.bind('<<ComboboxSelected>>', self.on_line_height_changed)
+        ttk.Label(
+            line_row, text='Auto is recommended; adjust only if recognition needs calibration.',
+            style='Small.TLabel',
+        ).pack(side='left', padx=(12, 0))
+
+        # Keep the existing controls for compatibility with enable/disable
+        # methods; just stop displaying redundant or diagnostic buttons.
+        for name in ('open_folder_btn', 'reprocess_btn', 'replay_live_btn', 'details_btn'):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.pack_forget()
+        self._rec_reminder.grid_forget()   # Guidance is in the capture selector.
+        self.advanced_toggle.grid_forget() # V2 popup entry remains callable.
+
+        # The advanced menu contains distinct settings and session operations.
+        self._v3_advanced_btn = ttk.Menubutton(self._recording_control, text='Advanced')
+        self._v3_advanced_menu = tk.Menu(self._v3_advanced_btn, tearoff=0)
+        self._v3_advanced_menu.add_command(
+            label='Advanced settings...', command=self._toggle_advanced_settings)
+        self._v3_session_menu = tk.Menu(
+            self._v3_advanced_menu, tearoff=0, postcommand=self._v3_refresh_session_menu)
+        self._v3_session_menu.add_command(
+            label='Reanalyze / rebuild current session', command=lambda: self.reprocess_selected())
+        self._v3_session_menu.add_command(
+            label='Replay live test (Full sessions)', command=lambda: self.replay_live_selected())
+        self._v3_session_menu.add_command(
+            label='Open current session folder', command=self.open_session_folder)
+        self._v3_advanced_menu.add_cascade(label='Session tools', menu=self._v3_session_menu)
+        self._v3_advanced_btn.configure(menu=self._v3_advanced_menu)
+
+        # The tabs already explain navigation. The old title duplicates them.
+        header = getattr(self, '_v3_results_header', None)
+        if header is not None:
+            header.pack_forget()
+
+        # No permanently empty progress bar in Ready state.  set_busy() and
+        # replay initialization restore it when useful.
+        self._v3_progress_frame = self.progress.master
+        self._v3_set_progress_visible(bool(getattr(self, 'proc', None)))
+        self.background_alert_var.trace_add('write', self._v3_background_changed)
+        self._recording_layout_mode = None
+        self._recording_reflow()
+
+    def _v3_refresh_help_menu(self):
+        # Do not start setup/update checks while a combat recording is active.
+        if not hasattr(self, '_v3_help_menu'):
+            return
+        state = 'normal' if self.proc is None else 'disabled'
+        self._v3_help_menu.entryconfigure(0, state=state)
+        self._v3_help_menu.entryconfigure(1, state=state)
+
+    def _v3_refresh_session_menu(self):
+        """Enable actions only when the selected session has the source data."""
+        try:
+            session = self.current_session or latest_session()
+            path = Path(session) if session is not None else None
+            idle = self.proc is None
+            video = bool(path is not None and (path / 'combat_changed_gray_ffv1.mkv').is_file())
+            ocr = bool(path is not None and (path / 'live_ocr_lines.csv').is_file()
+                       and (path / 'live_ocr_complete.json').is_file())
+            replay = video and (path / 'capture_index.csv').is_file()
+            self._v3_session_menu.entryconfigure(0, state='normal' if idle and (video or ocr) else 'disabled')
+            self._v3_session_menu.entryconfigure(1, state='normal' if idle and replay else 'disabled')
+            self._v3_session_menu.entryconfigure(2, state='normal' if idle and path is not None else 'disabled')
+        except (AttributeError, OSError, tk.TclError):
+            pass
+
+    def _v3_background_changed(self, *_args):
+        if getattr(self, '_v3_ready', False):
+            self.after_idle(self._recording_reflow)
+
+    def _v3_show_background_notice(self):
+        text = self.background_alert_var.get().strip().casefold()
+        # Hide only a genuinely confirmed positive result; keep cautionary
+        # 'checking' messages and all warnings visible.
+        return bool(text) and not ('live check ok' in text or 'live check ok.' in text)
+
+    def _v3_set_progress_visible(self, busy):
+        frame = getattr(self, '_v3_progress_frame', None)
+        if frame is None or not frame.winfo_exists():
+            return
+        if busy:
+            if not frame.winfo_manager():
+                frame.pack(fill='x', pady=(0, 5), before=self.notebook)
+        else:
+            frame.pack_forget()
+
+    def _recording_reflow(self, width=None):
+        """Adaptive V3 Recording: only four primary actions remain visible."""
+        if not getattr(self, '_recording_reflow_ready', False):
+            return
+        self._recording_resize_job = None
+        if not getattr(self, '_v3_ready', False):
+            return
+        width = int(width if width is not None else self.winfo_width())
+        available = max(380, width - 72)
+        area = self._rec_capture_row
+        actions = self._rec_action_row
+        sessions = self._rec_session_row
+        perf = self._rec_mode_row
+        advanced = self._v3_advanced_btn
+        warning = self.background_alert_label
+        show_warning = self._v3_show_background_notice()
+        show_perf_hint = width >= 1450
+        detail = self.performance_details
+        if show_perf_hint and not detail.winfo_manager():
+            detail.pack(side='left', fill='x', expand=True)
+        elif not show_perf_hint and detail.winfo_manager():
+            detail.pack_forget()
+
+        # Layout is dictated by actual requested widths as well as screen size.
+        primary_fit = area.winfo_reqwidth() + actions.winfo_reqwidth() + 24 <= available
+        footer_fit = (max(area.winfo_reqwidth(), sessions.winfo_reqwidth())
+                      + perf.winfo_reqwidth() + advanced.winfo_reqwidth() + 48 <= available)
+        if width >= 1150 and primary_fit and footer_fit:
+            mode = 'wide'
+        elif width >= 1050 and primary_fit:
+            mode = 'medium'
+        else:
+            mode = 'compact'
+        state = (mode, show_warning, show_perf_hint)
+        warning.configure(wraplength=max(320, min(available - 12, 1350)))
+        if state == getattr(self, '_recording_layout_mode', None):
+            return
+        for item in (area, actions, sessions, perf, advanced, warning, self.advanced_toggle, self._rec_reminder):
+            item.grid_forget()
+        control = self._recording_control
+        for i in range(3):
+            control.grid_columnconfigure(i, weight=1 if i in (0, 1) else 0, minsize=0)
+
+        if mode == 'wide':
+            area.grid(row=0, column=0, sticky='ew', padx=(0, 8), pady=(0, 3))
+            actions.grid(row=0, column=1, columnspan=2, sticky='ew', pady=(0, 3))
+            sessions.grid(row=1, column=0, sticky='w', padx=(0, 8))
+            perf.grid(row=1, column=1, sticky='w')
+            advanced.grid(row=1, column=2, sticky='e')
+            if show_warning:
+                warning.grid(row=2, column=0, columnspan=3, sticky='w', pady=(3, 0))
+        elif mode == 'medium':
+            area.grid(row=0, column=0, sticky='ew', padx=(0, 8), pady=(0, 3))
+            actions.grid(row=0, column=1, columnspan=2, sticky='ew', pady=(0, 3))
+            sessions.grid(row=1, column=0, columnspan=3, sticky='w', pady=(0, 3))
+            perf.grid(row=2, column=0, columnspan=2, sticky='w')
+            advanced.grid(row=2, column=2, sticky='e')
+            if show_warning:
+                warning.grid(row=3, column=0, columnspan=3, sticky='w', pady=(3, 0))
+        else:
+            area.grid(row=0, column=0, columnspan=3, sticky='ew', pady=(0, 3))
+            actions.grid(row=1, column=0, columnspan=3, sticky='ew', pady=(0, 3))
+            sessions.grid(row=2, column=0, sticky='w', pady=(0, 3))
+            perf.grid(row=2, column=1, sticky='w', pady=(0, 3))
+            advanced.grid(row=2, column=2, sticky='e', pady=(0, 3))
+            if show_warning:
+                warning.grid(row=3, column=0, columnspan=3, sticky='w', pady=(3, 0))
+        self._recording_layout_mode = state
+    # ===== END LOCAL SIMPLIFIED UI V3 =====
+
+    # ===== BEGIN LOCAL RESPONSIVE RECORDING V2 (Windows; no GitHub changes) =====
+    def _recording_on_resize(self, event=None):
+        # Tk sends Configure for child widgets as well; only react to root size.
+        if event is not None and event.widget is not self:
+            return
+        if not getattr(self, '_recording_reflow_ready', False):
+            return
+        if getattr(self, '_recording_resize_job', None) is not None:
+            try:
+                self.after_cancel(self._recording_resize_job)
+            except tk.TclError:
+                pass
+        self._recording_resize_job = self.after(65, self._recording_reflow)
+
+    def _hide_advanced_settings(self):
+        self._advanced_settings_open = False
+        if hasattr(self, 'advanced_window'):
+            self.advanced_window.withdraw()
+        self.advanced_toggle.configure(text='Advanced settings...')
+    # ===== END LOCAL RESPONSIVE RECORDING V2 =====
+
+    # ===== BEGIN LOCAL OVERVIEW REDESIGN (Windows; not a GitHub release) =====
+    def _overview_card(self, parent, title, var, col, font_style="OverviewValue.TLabel"):
+        frame = ttk.LabelFrame(parent, text=title, padding=(12, 7))
+        frame.grid(row=0, column=col, padx=4, pady=3, sticky="nsew")
+        ttk.Label(frame, textvariable=var, style=font_style, anchor="center").pack(
+            fill="x", expand=True, pady=(4, 6)
+        )
+        return frame
 
     def _build_overview(self):
+        # The public variables remain present because load_results / clear_live_state
+        # also use them. The selected-target presentation is refreshed afterwards.
         self.total_dealt_var = tk.StringVar(value="—")
         self.regular_var = tk.StringVar(value="—")
         self.sneak_var = tk.StringVar(value="—")
         self.total_taken_var = tk.StringVar(value="—")
-
-        cards = ttk.Frame(self.overview_tab)
-        cards.pack(fill="x")
-        for i in range(4):
-            cards.columnconfigure(i, weight=1)
-        self._metric_card(cards, "Total damage", self.total_dealt_var, 0)
-        self._metric_card(cards, "Regular", self.regular_var, 1)
-        self._metric_card(cards, "Sneak attack", self.sneak_var, 2)
-        self._metric_card(cards, "Damage taken", self.total_taken_var, 3)
-
-        netframe = ttk.LabelFrame(self.overview_tab, text="HP impact on targets", padding=12)
-        netframe.pack(fill="x", pady=(14, 0))
         self.healing_var = tk.StringVar(value="Healing to targets: —")
         self.net_loss_var = tk.StringVar(value="Net target HP loss: —")
-        ttk.Label(netframe, textvariable=self.healing_var, style="Section.TLabel").pack(side="left")
-        ttk.Label(netframe, textvariable=self.net_loss_var, style="Section.TLabel").pack(
-            side="left", padx=(30, 0)
-        )
-
-        perf = ttk.LabelFrame(self.overview_tab, text="Session performance", padding=12)
-        perf.pack(fill="x", pady=(12, 0))
         self.elapsed_dps_var = tk.StringVar(value="Session DPS: —")
         self.active_dps_var = tk.StringVar(value="Active combat DPS: —")
         self.blocked_var = tk.StringVar(value="Blocked/resisted: —")
         self.sneak_stats_var = tk.StringVar(value="Sneak: —")
-        for var in (self.elapsed_dps_var, self.active_dps_var, self.blocked_var, self.sneak_stats_var):
-            ttk.Label(perf, textvariable=var, style="Section.TLabel").pack(side="left", padx=(0, 24))
 
-        self.overview_note = ttk.Label(
-            self.overview_tab,
-            text="Results will appear here automatically when analysis is complete.",
-            wraplength=800
+        self.overview_target_var = tk.StringVar(value="All targets")
+        self.overview_quality_var = tk.StringVar(value="No analyzed session loaded")
+        self.overview_session_dps_var = tk.StringVar(value="—")
+        self.overview_total_var = tk.StringVar(value="—")
+        self.overview_net_var = tk.StringVar(value="—")
+        self.overview_active_var = tk.StringVar(value="—")
+        self.overview_duration_var = tk.StringVar(value="—")
+        self.overview_apm_var = tk.StringVar(value="—")
+        self.overview_crit_var = tk.StringVar(value="—")
+        self.overview_regular_var = tk.StringVar(value="Regular: —")
+        self.overview_sneak_var = tk.StringVar(value="Sneak: —")
+        self.overview_secondary_var = tk.StringVar(value="Damage taken: —   |   Healing to targets: —   |   Blocked / resisted: —")
+        self.overview_chart_caption_var = tk.StringVar(value="Rolling DPS preview appears after analysis")
+        self._overview_session_data = None
+        self._overview_split_fraction = 0.0
+        self._overview_graph_data = []
+
+        # The Overview is scrollable at 900x690 and for users with high DPI.
+        scroll = tk.Canvas(self.overview_tab, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(self.overview_tab, orient="vertical", command=scroll.yview)
+        scroll.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        scroll.pack(side="left", fill="both", expand=True)
+        content = ttk.Frame(scroll, padding=(4, 2, 8, 8))
+        canvas_item = scroll.create_window((0, 0), window=content, anchor="nw")
+        content.bind("<Configure>", lambda _event: scroll.configure(scrollregion=scroll.bbox("all")))
+        scroll.bind("<Configure>", lambda event: scroll.itemconfigure(canvas_item, width=event.width))
+
+        selector = ttk.Frame(content)
+        selector.pack(fill="x", pady=(0, 7))
+        ttk.Label(selector, text="Target:", style="Section.TLabel").pack(side="left")
+        self.overview_target_box = ttk.Combobox(
+            selector, textvariable=self.overview_target_var, values=("All targets",),
+            state="readonly", width=29,
         )
-        self.overview_note.pack(anchor="w", pady=(18, 0))
+        self.overview_target_box.pack(side="left", padx=(8, 15))
+        self.overview_target_box.bind("<<ComboboxSelected>>", self._overview_refresh)
+        ttk.Label(selector, textvariable=self.overview_quality_var, style="Small.TLabel").pack(
+            side="left", fill="x", expand=True
+        )
+
+        hero = ttk.Frame(content)
+        hero.pack(fill="x")
+        hero.columnconfigure(0, weight=3)
+        hero.columnconfigure(1, weight=2)
+        hero.columnconfigure(2, weight=2)
+        self._overview_card(hero, "SESSION DPS", self.overview_session_dps_var, 0, "OverviewHero.TLabel")
+        self._overview_card(hero, "TOTAL DAMAGE", self.overview_total_var, 1)
+        self._overview_card(hero, "NET HP LOSS", self.overview_net_var, 2)
+
+        ttk.Label(
+            content, text="Session DPS uses the analyzed damage interval (including the final-interval correction).",
+            style="Small.TLabel",
+        ).pack(anchor="w", padx=7, pady=(1, 5))
+
+        secondary = ttk.Frame(content)
+        secondary.pack(fill="x")
+        for i in range(4):
+            secondary.columnconfigure(i, weight=1)
+        self._overview_card(secondary, "ACTIVE COMBAT DPS", self.overview_active_var, 0, "OverviewMinor.TLabel")
+        self._overview_card(secondary, "COMBAT DURATION", self.overview_duration_var, 1, "OverviewMinor.TLabel")
+        self._overview_card(secondary, "AVERAGE APM", self.overview_apm_var, 2, "OverviewMinor.TLabel")
+        self._overview_card(secondary, "CRIT RATE / ATTACK", self.overview_crit_var, 3, "OverviewMinor.TLabel")
+
+        chart_box = ttk.LabelFrame(content, text="Rolling DPS · preview", padding=(8, 5))
+        chart_box.pack(fill="x", pady=(8, 4))
+        self.overview_chart = tk.Canvas(chart_box, height=82, highlightthickness=0, bg="#ffffff")
+        self.overview_chart.pack(fill="x", expand=False)
+        self.overview_chart.bind("<Configure>", lambda _event: self._overview_draw_graph())
+        chart_footer = ttk.Frame(chart_box)
+        chart_footer.pack(fill="x")
+        ttk.Label(chart_footer, textvariable=self.overview_chart_caption_var, style="Small.TLabel").pack(side="left")
+        ttk.Label(chart_footer, text="Full graph in DPS graph tab", style="Small.TLabel").pack(side="right")
+
+        split_box = ttk.LabelFrame(content, text="Damage breakdown", padding=(10, 6))
+        split_box.pack(fill="x", pady=(5, 4))
+        self.overview_split_canvas = tk.Canvas(
+            split_box, height=12, bg="#e9edf1", highlightthickness=0,
+        )
+        self.overview_split_canvas.pack(fill="x", pady=(0, 5))
+        self.overview_split_canvas.bind("<Configure>", lambda _event: self._overview_draw_split())
+        split_labels = ttk.Frame(split_box)
+        split_labels.pack(fill="x")
+        ttk.Label(split_labels, textvariable=self.overview_regular_var, style="Small.TLabel").pack(side="left")
+        ttk.Label(split_labels, textvariable=self.overview_sneak_var, style="Small.TLabel").pack(side="right")
+
+        ttk.Label(content, textvariable=self.overview_secondary_var, style="Small.TLabel").pack(
+            anchor="w", padx=7, pady=(7, 2)
+        )
+        self.overview_note = ttk.Label(
+            content, text="Choose Start Recording or open an existing session.",
+            style="Small.TLabel", wraplength=880,
+        )
+        self.overview_note.pack(anchor="w", padx=7, pady=(2, 2))
+
+    def _toggle_advanced_settings(self):
+        if getattr(self, "_advanced_settings_open", False):
+            self._hide_advanced_settings()
+            return
+        self._advanced_settings_open = True
+        self.advanced_window.deiconify()
+        self.advanced_window.lift()
+        self.advanced_toggle.configure(text="Hide advanced settings")
+        self.advanced_window.focus_set()
+
+    @staticmethod
+    def _overview_float(value):
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _overview_session_timing(events, batch_merge_seconds=0.10):
+        """Exact algorithm used by process_latest.session_damage_timing.
+
+        Do not substitute recording duration; a selected mob needs its own
+        observed first-to-last damage span with the same fencepost correction.
+        """
+        times = []
+        for event in events:
+            try:
+                t = float(event.get("elapsed_seconds"))
+                if t >= 0 and t < float("inf"):
+                    times.append(t)
+            except (ValueError, TypeError):
+                pass
+        times.sort()
+        unique_times = []
+        for t in times:
+            if not unique_times or abs(t - unique_times[-1]) > 1e-9:
+                unique_times.append(t)
+        batch_starts = []
+        last_in_batch = None
+        merge = max(0.0, float(batch_merge_seconds))
+        for t in unique_times:
+            if last_in_batch is None or t - last_in_batch > merge:
+                batch_starts.append(t)
+            last_in_batch = t
+        if len(batch_starts) < 2:
+            return 0.0
+        intervals = [b - a for a, b in zip(batch_starts, batch_starts[1:]) if b > a]
+        if not intervals:
+            return 0.0
+        intervals.sort()
+        n = len(intervals)
+        median = intervals[n // 2] if n % 2 else (intervals[n // 2 - 1] + intervals[n // 2]) / 2.0
+        return max(0.0, batch_starts[-1] - batch_starts[0]) + median
+
+    @staticmethod
+    def _overview_active_seconds(events, inactivity_timeout=5.0):
+        times = []
+        for event in events:
+            try:
+                t = float(event.get("elapsed_seconds"))
+                if 0 <= t < float("inf"):
+                    times.append(t)
+            except (ValueError, TypeError):
+                pass
+        times.sort()
+        if len(times) < 2:
+            return 0.0
+        return sum(min(max(0.0, b - a), max(0.0, float(inactivity_timeout)))
+                   for a, b in zip(times, times[1:]))
+
+    @staticmethod
+    def _overview_clock(seconds):
+        if seconds is None or seconds <= 0:
+            return "—"
+        n = int(round(seconds))
+        return f"{n // 60}:{n % 60:02d}"
+
+    @staticmethod
+    def _overview_rolling_points(events, window=15.0, samples=90):
+        """Timestamp-based graph for the selected target only; no global bleed."""
+        timed = []
+        for event in events:
+            try:
+                t = float(event.get("elapsed_seconds"))
+                amount = int(event.get("amount", 0) or 0)
+                if t >= 0 and t < float("inf") and amount > 0:
+                    timed.append((t, amount))
+            except (ValueError, TypeError):
+                pass
+        timed.sort()
+        if len(timed) < 2 or timed[-1][0] - timed[0][0] <= 0:
+            return []
+        start, end = timed[0][0], timed[-1][0]
+        interval = max(0.1, float(window))
+        left = right = 0
+        subtotal = 0
+        out = []
+        for index in range(max(1, int(samples)) + 1):
+            t = start + (end - start) * index / max(1, int(samples))
+            while right < len(timed) and timed[right][0] <= t + 1e-9:
+                subtotal += timed[right][1]
+                right += 1
+            while left < right and timed[left][0] <= t - interval:
+                subtotal -= timed[left][1]
+                left += 1
+            out.append((t - start, max(0, subtotal) / interval))
+        return out
+
+    def _overview_store_session(self, session, outgoing, incoming, healing,
+                                analysis_summary, normalized_attacks, normalized_confirms,
+                                attack_quality):
+        totals = {}
+        for event in outgoing:
+            name = str(event.get("target", "Unknown") or "Unknown")
+            totals[name] = totals.get(name, 0) + int(event.get("amount", 0) or 0)
+        sorted_targets = sorted(totals, key=lambda name: (-totals[name], name.casefold()))
+        self._overview_session_data = {
+            "session": str(session),
+            "outgoing": outgoing,
+            "incoming": incoming,
+            "healing": healing,
+            "summary": analysis_summary,
+            "attacks": normalized_attacks,
+            "confirms": normalized_confirms,
+            "attack_quality": attack_quality,
+        }
+        self.overview_target_box.configure(values=["All targets"] + sorted_targets)
+        # Each newly loaded session defaults to the mob receiving most damage.
+        self.overview_target_var.set(sorted_targets[0] if sorted_targets else "All targets")
+        self._overview_refresh()
+
+    def _overview_refresh(self, _event=None):
+        stored = getattr(self, "_overview_session_data", None)
+        if not stored:
+            return
+        name = self.overview_target_var.get()
+        all_targets = name == "All targets"
+        outgoing = stored["outgoing"] if all_targets else [
+            e for e in stored["outgoing"] if str(e.get("target") or "Unknown") == name
+        ]
+        healing = stored["healing"] if all_targets else [
+            e for e in stored["healing"] if str(e.get("target") or "Unknown") == name
+        ]
+        incoming = stored["incoming"] if all_targets else [
+            e for e in stored["incoming"] if self._source_matches_target(e.get("source", ""), name)
+        ]
+        summary = stored["summary"]
+        damage = sum(int(e["amount"]) for e in outgoing)
+        healed = sum(int(e["amount"]) for e in healing)
+        regular = sum(int(e["amount"]) for e in outgoing if e.get("mode") == "regular")
+        sneak = sum(int(e["amount"]) for e in outgoing if e.get("mode") == "sneak")
+        taken = sum(int(e["amount"]) for e in incoming)
+        blocked = sum(int(e.get("blocked_amount") or 0) for e in outgoing)
+
+        # Prefer authoritative summary values only when viewing *all* targets.
+        # Per-target DPS is independently recalculated from that mob's events.
+        duration = self._overview_session_timing(outgoing)
+        active_secs = self._overview_active_seconds(
+            outgoing, self._overview_float(summary.get("inactivity_timeout_seconds")) or 5.0
+        )
+        if all_targets:
+            stored_duration = self._overview_float(summary.get("session_duration_seconds"))
+            if stored_duration is not None:
+                duration = stored_duration
+            stored_active = self._overview_float(summary.get("active_combat_seconds"))
+            if stored_active is not None:
+                active_secs = stored_active
+        dps = damage / duration if duration > 0 else None
+        active_dps = damage / active_secs if active_secs > 0 else None
+        if all_targets:
+            official = self._overview_float(summary.get("session_dps"))
+            if official is not None:
+                dps = official
+            official_active = self._overview_float(summary.get("active_combat_dps"))
+            if official_active is not None:
+                active_dps = official_active
+
+        self.overview_session_dps_var.set(dknum(round(dps)) if dps is not None else "N/A")
+        self.overview_total_var.set(dknum(damage))
+        self.overview_net_var.set(dknum(damage - healed))
+        self.overview_active_var.set(dknum(round(active_dps)) if active_dps is not None else "N/A")
+        self.overview_duration_var.set(self._overview_clock(duration))
+
+        attacks = stored["attacks"] if all_targets else [
+            a for a in stored["attacks"] if a.get("target") == name
+        ]
+        confirms = stored["confirms"] if all_targets else [
+            c for c in stored["confirms"] if c.get("target") == name
+        ]
+        quality = stored["attack_quality"]
+        scoped = list(quality.values()) if all_targets else ([quality[name]] if name in quality else [])
+        apm_ok = bool(attacks) and bool(scoped) and duration > 0 and all(q.get("apm_reliable", False) for q in scoped)
+        crit_ok = bool(attacks) and bool(scoped) and all(q.get("crit_rate_valid", False) for q in scoped)
+        apm = len(attacks) * 60.0 / duration if apm_ok else None
+        confirmed_crits = sum(c.get("outcome") == "confirmed" for c in confirms)
+        crit_pct = 100.0 * confirmed_crits / len(attacks) if crit_ok else None
+        self.overview_apm_var.set(f"{apm:.1f}" if apm is not None else "N/A")
+        self.overview_crit_var.set(f"{crit_pct:.1f}%" if crit_pct is not None else "N/A")
+
+        self._overview_split_fraction = regular / damage if damage else 0.0
+        self.overview_regular_var.set(
+            f"Regular: {dknum(regular)} ({100.0 * regular / damage:.1f}%)" if damage else "Regular: —"
+        )
+        self.overview_sneak_var.set(
+            f"Sneak: {dknum(sneak)} ({100.0 * sneak / damage:.1f}%)" if damage else "Sneak: —"
+        )
+        self.overview_secondary_var.set(
+            f"Damage taken: {dknum(taken)}   |   Healing to targets: {dknum(healed)}   |   "
+            f"Blocked / resisted: {dknum(blocked)}"
+        )
+        dq = summary.get("data_quality", {}) or {}
+        try:
+            suspicious = int(dq.get("suspicious_unparsed_damage_lines", 0) or 0)
+        except (TypeError, ValueError):
+            suspicious = 0
+        if suspicious:
+            quality_note = f"OCR review suggested · {suspicious} unparsed damage-like lines"
+        elif any(q.get("status") != "OK" for q in scoped):
+            quality_note = "Attack statistics incomplete · see Data quality"
+        elif not attacks:
+            quality_note = "Attack statistics unavailable"
+        else:
+            quality_note = "No flagged attack-data issues · see Data quality"
+        self.overview_quality_var.set(quality_note)
+        self.overview_note.configure(
+            text=("All targets combined" if all_targets else f"Selected target: {name}") +
+                 " · APM = observed attacks per minute over the selected damage session."
+        )
+
+        window = self._overview_float(summary.get("rolling_window_seconds")) or 15.0
+        if all_targets and getattr(self, "dps_points", None):
+            self._overview_graph_data = list(self.dps_points)
+        else:
+            self._overview_graph_data = self._overview_rolling_points(outgoing, window=window)
+        self.overview_chart_caption_var.set(
+            f"{window:g} s rolling DPS · " + ("all targets" if all_targets else "selected target")
+        )
+        self._overview_draw_split()
+        self._overview_draw_graph()
+
+    def _overview_draw_split(self):
+        canvas = getattr(self, "overview_split_canvas", None)
+        if canvas is None:
+            return
+        width = max(1, int(canvas.winfo_width()))
+        height = max(1, int(canvas.winfo_height()))
+        canvas.delete("all")
+        canvas.create_rectangle(0, 0, width, height, fill="#e9edf1", outline="")
+        split = max(0.0, min(1.0, float(self._overview_split_fraction)))
+        boundary = width * split
+        if boundary > 0:
+            canvas.create_rectangle(0, 0, boundary, height, fill="#326fa8", outline="")
+        if boundary < width and getattr(self, "_overview_session_data", None):
+            canvas.create_rectangle(boundary, 0, width, height, fill="#dba047", outline="")
+
+    def _overview_draw_graph(self):
+        canvas = getattr(self, "overview_chart", None)
+        if canvas is None:
+            return
+        canvas.delete("all")
+        width = max(60, int(canvas.winfo_width()))
+        height = max(45, int(canvas.winfo_height()))
+        left, right, top, bottom = 30, width - 8, 8, height - 17
+        canvas.create_line(left, bottom, right, bottom, fill="#cbd5df")
+        canvas.create_line(left, top, left, bottom, fill="#cbd5df")
+        points = getattr(self, "_overview_graph_data", [])
+        if not points:
+            canvas.create_text(width / 2, height / 2, text="No timed damage samples", fill="#777777")
+            return
+        try:
+            timed = [(float(t), max(0.0, float(v))) for t, v in points]
+        except (ValueError, TypeError):
+            return
+        max_t = max(t for t, _ in timed)
+        min_t = min(t for t, _ in timed)
+        top_dps = max(1.0, max(v for _, v in timed))
+        span = max(1e-9, max_t - min_t)
+        coords = []
+        for t, v in timed:
+            x = left + (t - min_t) / span * (right - left)
+            y = bottom - v / top_dps * (bottom - top)
+            coords.extend([x, y])
+        if len(coords) >= 4:
+            canvas.create_line(*coords, fill="#246a9a", width=2, smooth=False)
+        canvas.create_text(left, bottom + 11, text="0:00", anchor="w", fill="#6c7380", font=("Segoe UI", 8))
+        canvas.create_text(right, bottom + 11, text=self._overview_clock(max_t - min_t),
+                           anchor="e", fill="#6c7380", font=("Segoe UI", 8))
+        canvas.create_text(right, top, text=f"Peak {dknum(round(top_dps))}",
+                           anchor="ne", fill="#4c5a6b", font=("Segoe UI", 8))
+    # ===== END LOCAL OVERVIEW REDESIGN =====
 
     @staticmethod
     def _tree_sort_key(value, numeric=False):
@@ -2389,6 +3018,7 @@ class App(tk.Tk):
         self.progress.config(mode="determinate", maximum=100, value=value)
 
     def set_busy(self, busy, text=None):
+        self._v3_set_progress_visible(bool(busy))
         if busy:
             self.progress.config(mode="indeterminate")
             self.progress.start(12)
@@ -2426,6 +3056,7 @@ class App(tk.Tk):
         self.progress_text.config(text=text)
 
     def begin_replay_progress(self, session_name):
+        self._v3_set_progress_visible(True)
         """Initialize one combined meter for concurrent replay frame/OCR work."""
         self._replay_progress_value = 0.0
         self._replay_frames_done = 0
@@ -3566,6 +4197,8 @@ class App(tk.Tk):
         self.replay_live_btn.config(state="disabled")
         self.system_button.config(state="disabled")
         self.line_height_combo.config(state="disabled")
+        if hasattr(self, "_v3_line_height_combo"):
+            self._v3_line_height_combo.config(state="disabled")
         self.hotkey_combo.config(state="disabled")
         self.rolling_window_combo.config(state="disabled")
         self.overlay_font_size_combo.config(state="disabled")
@@ -3584,6 +4217,8 @@ class App(tk.Tk):
         self.update_reprocess_button_state()
         self.system_button.config(state="normal")
         self.line_height_combo.config(state="readonly")
+        if hasattr(self, "_v3_line_height_combo"):
+            self._v3_line_height_combo.config(state="readonly")
         self.hotkey_combo.config(state="readonly")
         self.rolling_window_combo.config(state="readonly")
         self.overlay_font_size_combo.config(state="readonly")
@@ -3968,6 +4603,23 @@ class App(tk.Tk):
         self._reset_tree_sort(tree)
 
     def clear_live_state(self):
+        self._overview_session_data = None
+        self._overview_split_fraction = 0.0
+        self._overview_graph_data = []
+        self.overview_target_var.set("All targets")
+        self.overview_target_box.configure(values=("All targets",))
+        self.overview_quality_var.set("No analyzed session loaded")
+        for var in (self.overview_session_dps_var, self.overview_total_var,
+                    self.overview_net_var, self.overview_active_var,
+                    self.overview_duration_var, self.overview_apm_var,
+                    self.overview_crit_var):
+            var.set("—")
+        self.overview_regular_var.set("Regular: —")
+        self.overview_sneak_var.set("Sneak: —")
+        self.overview_secondary_var.set("Damage taken: —   |   Healing to targets: —   |   Blocked / resisted: —")
+        self.overview_chart_caption_var.set("Rolling DPS preview appears after analysis")
+        self._overview_draw_split()
+        self._overview_draw_graph()
         self.total_dealt_var.set("—")
         self.regular_var.set("—")
         self.sneak_var.set("—")
@@ -4502,6 +5154,10 @@ class App(tk.Tk):
         self.diag_text.config(state="disabled")
 
         self.load_dps_graph(session)
+        self._overview_store_session(
+            session, outgoing, incoming, healing, analysis_summary,
+            normalized_attacks, normalized_confirms, attack_quality,
+        )
 
         self.current_session = session
         self.open_folder_btn.config(state="normal")
@@ -4637,6 +5293,13 @@ class App(tk.Tk):
             win.destroy()
             self.reprocess_selected(session)
 
+        def replay_selected():
+            session = selected_session()
+            if session is None:
+                return
+            win.destroy()
+            self.replay_live_selected(session)
+
         def folder_selected():
             session = selected_session()
             if session is None:
@@ -4657,7 +5320,20 @@ class App(tk.Tk):
         buttons = ttk.Frame(win)
         buttons.pack(fill="x", padx=14, pady=(0, 14))
         ttk.Button(buttons, text="Open analysis", command=open_selected).pack(side="left")
-        ttk.Button(buttons, text="Reanalyze FFV1", command=reanalyze_selected).pack(side="left", padx=(8, 0))
+        reanalyze_action = ttk.Button(buttons, text="Reanalyze / rebuild", command=reanalyze_selected)
+        reanalyze_action.pack(side="left", padx=(8, 0))
+        replay_action = ttk.Button(buttons, text="Replay live (Full)", command=replay_selected)
+        replay_action.pack(side="left", padx=(8, 0))
+        def refresh_session_tools(_event=None):
+            selected = selected_session()
+            video = bool(selected and (selected / "combat_changed_gray_ffv1.mkv").is_file())
+            ocr = bool(selected and (selected / "live_ocr_lines.csv").is_file()
+                       and (selected / "live_ocr_complete.json").is_file())
+            replay_ok = bool(video and (selected / "capture_index.csv").is_file())
+            reanalyze_action.config(state="normal" if video or ocr else "disabled")
+            replay_action.config(state="normal" if replay_ok else "disabled")
+        tree.bind("<<TreeviewSelect>>", refresh_session_tools, add="+")
+        refresh_session_tools()
         ttk.Button(buttons, text="Open folder", command=folder_selected).pack(side="left", padx=(8, 0))
         ttk.Button(buttons, text="Close", command=win.destroy).pack(side="right")
 
