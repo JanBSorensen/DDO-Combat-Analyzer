@@ -33,8 +33,9 @@ from crit_roll_tables import (write_d20_distributions, confirmation_summary)
 from live_post_diagnostics import reconcile
 from damage_row_parser import (
     damage_wrap_kind, join_damage_wrap, is_complete_outgoing, outgoing_b_token,
-    find_unparsed_candidates, NUM_TOKEN_WITH_B,
+    NUM_TOKEN_WITH_B,
 )
+from damage_parse_quality import build_damage_parse_audit, classify_damage_candidate
 
 
 # ---------------------------------------------------------------------------
@@ -761,7 +762,7 @@ BLOCKED_REASON_RE = re.compile(
     re.IGNORECASE,
 )
 ZERO_BLOCKED_OUT_RE = re.compile(
-    rf"\bYou\s+(?P<kind>sneak\s+attack|hit)\s+(?P<target>.+?)\s+"
+    rf"\bYou\s+(?P<kind>sneak\s+attack|hit|graz(?:e|ed))\s+(?P<target>.+?)\s+"
     rf"but\s+did\s+no\s+damage;\s*(?P<blocked>{NUM_TOKEN})\s+points?\s+of\s+damage\s+"
     rf"(?:were|was)\s+blocked(?:\s+by\s+(?P<reason>.+?))?(?:[.!]|$)",
     re.IGNORECASE,
@@ -1345,14 +1346,10 @@ def parse_combat_events(texts, line_times=None, line_numbers=None, resolver=None
                         })
                     parsed = True
 
-        # Flag lines that look damage/healing-related but did not parse.
-        if not parsed:
-            low = line.lower()
-            if (
-                (" damage" in low and ("you " in low or " you " in low))
-                or ("healed" in low and "you" in low)
-            ):
-                suspicious.append((line_no, line))
+        # Only real damage-message starts are suspects. Generic 'damage' in a
+        # buff or a healing effect name is not evidence of missed damage.
+        if not parsed and classify_damage_candidate(line):
+            suspicious.append((line_no, line))
 
     return outgoing, incoming, healing, corrections, suspicious
 
@@ -1777,7 +1774,7 @@ def csv_row_count(path):
 
 def create_reports(
     session, texts, outgoing, incoming, healing, attacks, confirms, defensive_misses,
-    corrections, suspicious, frame_no, visual_line_count
+    corrections, suspicious, frame_no, visual_line_count, parse_coverage=None
 ):
     target_stats, overall_type, target_type, incoming_type, incoming_source = aggregate(
         outgoing, incoming, healing
@@ -2077,6 +2074,12 @@ def create_reports(
     lines.append("-" * 78)
     lines.append(f"Numeric OCR corrections applied: {len(corrections)}")
     lines.append(f"Damage-like lines not parsed:     {len(suspicious)}")
+    if parse_coverage is not None:
+        lines.append(f"  Outgoing positive damage:       {parse_coverage.get('unparsed_positive_damage_count', 0)}")
+        lines.append(f"  Outgoing fully blocked:         {parse_coverage.get('unparsed_zero_damage_count', 0)}")
+        lines.append(f"  Incoming damage:               {parse_coverage.get('unparsed_incoming_damage_count', 0)}")
+        lines.append(f"  Ignored keyword-only messages: {parse_coverage.get('ignored_keyword_only_lines', 0)}")
+        lines.append("  Details: damage_parse_coverage.json / damage_parse_audit.csv")
     lines.append("")
     lines.append("TECHNICAL")
     lines.append("-" * 78)
@@ -2508,6 +2511,11 @@ def create_reports(
             "post_numeric_corrections": len(corrections),
             "live_numeric_corrections": live_corrections,
             "suspicious_unparsed_damage_lines": len(suspicious),
+            "unparsed_positive_damage_lines": (parse_coverage or {}).get("unparsed_positive_damage_count", 0),
+            "unparsed_zero_damage_lines": (parse_coverage or {}).get("unparsed_zero_damage_count", 0),
+            "unparsed_incoming_damage_lines": (parse_coverage or {}).get("unparsed_incoming_damage_count", 0),
+            "ignored_keyword_only_lines": (parse_coverage or {}).get("ignored_keyword_only_lines", 0),
+            "damage_parse_coverage": parse_coverage or {},
             "event_count_agreement": (live_event_count == len(outgoing)) if live_event_count else None,
             "focus_interruptions": len(focus_interruptions),
             "focus_interruption_seconds": focus_interruption_seconds,
@@ -3322,7 +3330,7 @@ def main():
         damage_texts, damage_times, damage_line_numbers, resolver=guard.resolve
     )
     guard.save(session / 'post_numeric_validation.csv')
-    coverage = save_damage_parse_coverage(session, texts, outgoing, 'ffv1_post')
+    coverage = save_damage_parse_coverage(session, texts, outgoing, 'ffv1_post', incoming=incoming, healing=healing)
     shutil.copy2(session / 'post_numeric_validation.csv', session / 'ffv1_post_numeric_validation.csv')
     parse_total_seconds = time.perf_counter() - damage_parse_t0
     timings.append(("damage_healing_parse", max(0.0, parse_total_seconds - guard.ocr_seconds)))
@@ -3359,7 +3367,7 @@ def main():
     report_t0 = time.perf_counter()
     result = create_reports(
         session, texts, outgoing, incoming, healing, attacks, confirms, defensive_misses,
-        corrections, suspicious, frame_no, len(visual_lines)
+        corrections, suspicious, frame_no, len(visual_lines), parse_coverage=coverage
     )
     append_damage_coverage_warning(session / 'COMBAT_REPORT.txt', coverage)
     append_background_warning(session / 'COMBAT_REPORT.txt', background_report)
@@ -3424,48 +3432,61 @@ def main():
 
 
 
-def save_damage_parse_coverage(session, raw_texts, outgoing, source):
-    """Audit every damage-like OCR start against parsed outgoing events.
+def save_damage_parse_coverage(session, raw_texts, outgoing, source, incoming=(), healing=()):
+    """Independently audit OCR message starts, not just the parsed event list.
 
-    This is deliberately an independent count of raw OCR messages, not a
-    comparison of two paths through the same parsed-event list.  Zero-damage
-    reductions and unrelated `You hit ... with <effect>` are excluded.
+    Distinguish actual positive/zero/incoming damage candidates from buffs,
+    healing and other unrelated lines that merely mention the word "damage".
     """
-    unmatched = find_unparsed_candidates(raw_texts, [e['line'] for e in outgoing])
-    candidate_lines = [i for i, t in enumerate(raw_texts, 1)
-                       if re.search(r'\bYou\s+(?:sneak\s+attack|hit)\s+.+?\s+for\s+', t, re.I)]
-    record = {
-        'analysis_source': source,
-        'candidate_outgoing_damage_messages':len(candidate_lines),
-        'parsed_outgoing_damage_messages':len(outgoing),
-        'unmatched_candidate_count':len(unmatched),
-        'unmatched_candidate_lines':unmatched[:300],
-        'unmatched_examples':[{'source_line':i,'ocr_text':raw_texts[i-1]}
-                              for i in unmatched[:30]],
-    }
-    path=session/'damage_parse_coverage.json'
-    path.write_text(json.dumps(record,indent=2),encoding='utf-8')
-    if unmatched:
-        print(f'WARNING: {len(unmatched)} outgoing damage OCR messages were not '
-              f'parsed (see {path.name}).',flush=True)
+    record, audit_rows = build_damage_parse_audit(
+        raw_texts, outgoing, incoming, healing, source=source
+    )
+    path = session / "damage_parse_coverage.json"
+    path.write_text(json.dumps(record, indent=2), encoding="utf-8")
+    with (session / "damage_parse_audit.csv").open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["line", "category", "status", "ocr_text"])
+        writer.writerows(audit_rows)
+    if record["unparsed_damage_count"]:
+        print(
+            f"WARNING: {record['unparsed_damage_count']} credible OCR damage "
+            f"messages were not parsed (see {path.name} and damage_parse_audit.csv).",
+            flush=True,
+        )
     return record
 
 
 def append_damage_coverage_warning(report_path, coverage):
-    """Put missed damage candidates at the very top of the human-readable report."""
-    n = int(coverage.get('unmatched_candidate_count', 0))
-    if not n:
+    """Warn about the correct statistics without implying zero damage was lost."""
+    positive = int(coverage.get("unparsed_positive_damage_count", 0))
+    zero = int(coverage.get("unparsed_zero_damage_count", 0))
+    incoming = int(coverage.get("unparsed_incoming_damage_count", 0))
+    if not (positive or zero or incoming):
         return
     report_path = Path(report_path)
     if not report_path.is_file():
         return
-    warning = (
-        f"WARNING: {n} damage-like Combat Log messages could not be parsed.\n"
-        "The damage total may be incomplete. Open damage_parse_coverage.json "
-        "for source line numbers.\n\n"
-    )
-    report_path.write_text(warning + report_path.read_text(encoding='utf-8'),
-                           encoding='utf-8')
+    notices = []
+    if positive:
+        notices.append(
+            f"WARNING: {positive} outgoing positive-damage messages were not parsed; "
+            "outgoing damage/DPS may be incomplete."
+        )
+    if zero:
+        notices.append(
+            f"WARNING: {zero} outgoing fully blocked hits were not parsed; "
+            "blocked-damage statistics may be incomplete (not outgoing DPS)."
+        )
+    if incoming:
+        notices.append(
+            f"WARNING: {incoming} incoming-damage messages were not parsed; "
+            "damage-taken statistics may be incomplete."
+        )
+    notices.append("Inspect damage_parse_coverage.json and damage_parse_audit.csv.")
+    body = report_path.read_text(encoding="utf-8")
+    if body.startswith("WARNING:") and "damage_parse_audit.csv." in body.split("\n\n", 1)[0]:
+        return
+    report_path.write_text("\n".join(notices) + "\n\n" + body, encoding="utf-8")
 
 
 def append_background_warning(report_path, report):
@@ -3564,7 +3585,7 @@ def _fast_live_analysis(session, log_rows, log_metadata):
     outgoing, incoming, healing, corrections, suspicious = parse_combat_events(
         messages, message_times, message_lines, resolver=guard.resolve)
     guard.save(session / 'post_numeric_validation.csv')
-    coverage = save_damage_parse_coverage(session, texts, outgoing, 'live_ocr_fast')
+    coverage = save_damage_parse_coverage(session, texts, outgoing, 'live_ocr_fast', incoming=incoming, healing=healing)
     is_light = mode_from_config(json.loads((session / 'config_used.json').read_text(encoding='utf-8'))) == 'light'
     if not is_light:
         shutil.copy2(session / 'post_numeric_validation.csv', session / 'fast_live_numeric_validation.csv')
@@ -3574,7 +3595,7 @@ def _fast_live_analysis(session, log_rows, log_metadata):
     defensive_misses = parse_incoming_defense_events(texts, times, list(range(1,len(texts)+1)))
     print('PROGRESS|PARSE|1|1', flush=True)
     create_reports(session, texts, outgoing, incoming, healing, attacks, confirms,
-                   defensive_misses, corrections, suspicious, 0, len(texts))
+                   defensive_misses, corrections, suspicious, 0, len(texts), parse_coverage=coverage)
     append_damage_coverage_warning(session / 'COMBAT_REPORT.txt', coverage)
     background_live = live_background_quality(session)
     append_background_warning(session / 'COMBAT_REPORT.txt', background_live)
